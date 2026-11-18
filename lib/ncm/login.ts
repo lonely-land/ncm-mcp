@@ -44,13 +44,18 @@ function successOutcome(body: any, jar: CookieJar): LoginOutcome {
 /**
  * Poll a QR key. `801` waiting, `802` scanned-but-unconfirmed, `800` expired,
  * `803` authorised. Only `803` carries the session cookies.
+ *
+ * Note: the upstream `login_qr_check` module has a bug in its catch block (it
+ * references an out-of-scope `result`), so an upstream error surfaces as
+ * `ReferenceError: result is not defined`. Treated here as a transient failure rather
+ * than letting it reach the user as a crash.
  */
 export async function pollQr(key: string, fakeIp?: string): Promise<{
   status: number
   message: string
   outcome?: LoginOutcome
 }> {
-  const result = await callNcm('login_qr_check', { key, noCookie: true }, { fakeIp })
+  const result = await callNcm('login_qr_check', { key }, { fakeIp })
   const code = Number(result.body?.code ?? 0)
   const jar = result.jar ?? parseSetCookie(undefined)
 
@@ -66,8 +71,23 @@ export async function pollQr(key: string, fakeIp?: string): Promise<{
         return { status: 803, message: 'Authorised but no session cookie was returned' }
       }
       return { status: 803, message: 'Signed in', outcome: successOutcome(result.body, jar) }
-    default:
+    default: {
+      const upstream = String(result.body?.message ?? result.body?.msg ?? '')
+      const riskGated = /验证|captcha|verify/i.test(upstream)
+      if (/result is not defined/i.test(upstream)) {
+        // Upstream threw before returning a status; the QR key is normally still valid,
+        // so keep polling rather than failing the sign-in.
+        return { status: 801, message: 'Waiting for scan' }
+      }
+      if (riskGated) {
+        return {
+          status: 400,
+          message:
+            'NetEase asked for human verification. Request a new QR code, or switch to SMS / password sign-in.',
+        }
+      }
       return { status: code, message: describeFailure(result.body, 'QR login failed') }
+    }
   }
 }
 
