@@ -11,7 +11,9 @@ import { createServer, sessionFromAuthInfo } from '@/lib/mcp/server'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
-export const maxDuration = 300
+// Hobby caps function duration at 60s; NetEase calls finish in a few seconds, so this
+// is ample. Raise it (and add regions) only on a Pro plan.
+export const maxDuration = 60
 
 const resourceUrl = mcpResourceUrl()
 
