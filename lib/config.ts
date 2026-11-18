@@ -92,21 +92,20 @@ export function enabledToolsets(): Set<string> | 'all' {
 }
 
 /**
- * Tools hidden when `NCM_DISABLED_TOOLS` is unset: the account personal-info and
- * session-identity wrappers. Setting the variable replaces this list entirely, so
- * `NCM_DISABLED_TOOLS=` disables nothing. Names are lower-cased tool names.
+ * Tools hidden when `NCM_DISABLED_TOOLS` is unset. Empty by default: no curated tool
+ * mutates account personal info or session identity, so the tool layer needs no net.
+ * The switch stays available for operators who want one. Names are lower-cased.
  */
-export const DEFAULT_DISABLED_TOOLS: readonly string[] = [
-  'ncm_account_profile',
-  'ncm_user_binding',
-  'ncm_vip_info',
-  'ncm_yunbei',
-  'ncm_user_level',
-  'ncm_user_counts',
-  'ncm_listen_stats',
-  'ncm_logout',
-  'ncm_daily_signin',
-]
+export const DEFAULT_DISABLED_TOOLS: readonly string[] = []
+
+function csvSet(raw: string | undefined, fallback: readonly string[]): Set<string> {
+  const names = raw === undefined ? fallback : raw.split(',')
+  return new Set(
+    names
+      .map((entry) => entry.trim().toLowerCase())
+      .filter(Boolean),
+  )
+}
 
 /**
  * Per-tool denylist, subtracted from whatever `NCM_TOOLSETS` enables. An unset
@@ -114,13 +113,74 @@ export const DEFAULT_DISABLED_TOOLS: readonly string[] = [
  * is used verbatim, so an empty list disables nothing.
  */
 export function disabledTools(): Set<string> {
-  const raw = process.env.NCM_DISABLED_TOOLS
-  const names = raw === undefined ? DEFAULT_DISABLED_TOOLS : raw.split(',')
-  return new Set(
-    names
-      .map((entry) => entry.trim().toLowerCase())
-      .filter(Boolean),
-  )
+  return csvSet(process.env.NCM_DISABLED_TOOLS, DEFAULT_DISABLED_TOOLS)
+}
+
+/**
+ * Upstream endpoints `ncm_raw` refuses, and that `ncm_list_endpoints` hides. Two
+ * reasons only, kept separate below so the intent stays legible:
+ *
+ * 1. **Account-identity mutation** — renaming, avatar changes, profile settings,
+ *    linked-account rebinding, phone replacement and session termination. No curated
+ *    tool wraps these, so raw passthrough was the only route to them.
+ * 2. **Spends money** — gifting, paid chart placement, coin expenditure, digital-album
+ *    ordering. No curated tool spends money either.
+ *
+ * Everything else stays reachable, including the playlist, comment, like, follow,
+ * share, scrobble and cloud-upload writes, `yunbei_sign`-style earns, the purchase
+ * *history* reads (`digitalAlbum_purchased`, `song_purchased`, `digitalAlbum_sales`,
+ * `yunbei`, `yunbei_info`, `yunbei_receipt`, `vip_*`) and the download-URL endpoints
+ * (`song_download_url`, `song_download_url_v1`, `song_cloud_download`), which return
+ * URLs without charging.
+ */
+export const DEFAULT_BLOCKED_RAW_ENDPOINTS: readonly string[] = [
+  // --- identity mutation -------------------------------------------------
+  // Profile text and avatar.
+  'user_update',
+  'avatar_upload',
+  'setting',
+  'user_social_status_edit',
+  'activate_init_profile',
+  'nickname_check',
+  // Linked accounts and phone number.
+  'rebind',
+  'user_replacephone',
+  'user_bindingcellphone',
+  // Session identity: logout, remote device eviction, sign-in and registration.
+  'logout',
+  'device_kickoff',
+  'login',
+  'login_cellphone',
+  'login_qr_check',
+  'login_qr_create',
+  'login_qr_key',
+  'login_refresh',
+  'login_status',
+  'register_anonimous',
+  'register_cellphone',
+  'register_checktoken_v2',
+  'register_checktoken_v3',
+  'register_neapikey',
+  'register_xeapikey',
+  'captcha_safe_sent',
+  'captcha_sent',
+  'captcha_sent_v1',
+  'captcha_verify',
+
+  // --- spends money ------------------------------------------------------
+  'dj_paygift', // radio programme gifting
+  'dj_toplist_pay', // paid chart placement
+  'yunbei_expense', // coin expenditure
+  'digitalAlbum_ordering', // digital album purchase
+]
+
+/**
+ * Endpoints `ncm_raw` may not proxy. Same semantics as the tool denylist: unset uses
+ * `DEFAULT_BLOCKED_RAW_ENDPOINTS`, and a set variable (including an empty one)
+ * replaces it, so `NCM_BLOCKED_RAW_ENDPOINTS=` blocks nothing.
+ */
+export function blockedRawEndpoints(): Set<string> {
+  return csvSet(process.env.NCM_BLOCKED_RAW_ENDPOINTS, DEFAULT_BLOCKED_RAW_ENDPOINTS)
 }
 
 export const FALLBACK_RANDOM_CN_IP = process.env.NCM_FALLBACK_RANDOM_CN_IP === 'true'

@@ -4,7 +4,7 @@ A **stateless** Model Context Protocol server for the [NeteaseCloudMusicApiEnhan
 
 Because the session lives in the token rather than in a database, **this deployment stores no user data at rest.** Any instance can serve any request.
 
-- 86 curated tools across 8 toolsets, plus `ncm_raw` for any of the 451 underlying endpoints
+- 86 curated tools across 8 toolsets, plus `ncm_raw` for the 451 underlying endpoints (account-identity and money-spending ones excluded)
 - QR / SMS / password sign-in, all through the same OAuth flow
 - PKCE (S256), RFC 9728 protected resource metadata, RFC 8414 authorization server metadata
 - Client ID Metadata Documents (CIMD) and stateless dynamic client registration
@@ -63,7 +63,8 @@ Set these in the Vercel project, then deploy:
 | --- | --- | --- |
 | `NCM_TOKEN_SECRET` | yes | 16+ chars; `openssl rand -base64 32` |
 | `NCM_TOOLSETS` | no | e.g. `search,music,discover`; default `all` |
-| `NCM_DISABLED_TOOLS` | no | tool names to hide, e.g. `ncm_listen_stats,ncm_yunbei`; default is the account/session deny set (see [Tool denylist](#tool-denylist)) |
+| `NCM_DISABLED_TOOLS` | no | tool names to hide, e.g. `ncm_listen_stats,ncm_yunbei`; empty by default (see [Tool denylist](#tool-denylist)) |
+| `NCM_BLOCKED_RAW_ENDPOINTS` | no | endpoints `ncm_raw` refuses, e.g. `digitalAlbum_ordering`; default blocks identity mutation and money-spending endpoints (see [Raw endpoint blocklist](#raw-endpoint-blocklist)) |
 | `MCP_PUBLIC_ORIGIN` | no | only for a custom domain |
 | `NCM_FALLBACK_RANDOM_CN_IP` | no | see [FakeIP](#fakeip) |
 
@@ -114,24 +115,33 @@ npx @modelcontextprotocol/inspector --cli https://<your-deployment>/mcp --transp
 | `social` | 10 | follow users, subscribe artists/MV/radio, DMs, activity feed, share |
 | `meta` | 3 | `ncm_list_endpoints`, `ncm_raw`, `ncm_about` |
 
-Counts are the registered totals; `NCM_DISABLED_TOOLS` may hide some of them (nine account/session tools by default), and `NCM_TOOLSETS` may drop whole groups.
+Counts are the registered totals; `NCM_DISABLED_TOOLS` may hide some of them, and `NCM_TOOLSETS` may drop whole groups.
 
-`ncm_raw` reaches all 451 endpoints. Read-only ones are always allowed; any other endpoint needs the `ncm:write` scope, and without it the call returns an error asking the caller to acquire that scope — it does not run a step-up challenge. Only the curated write tools (`scopeChallenge` on registration) take the step-up path.
+`ncm_raw` reaches all 451 endpoints, minus the [blocked ones](#raw-endpoint-blocklist). Read-only endpoints are always allowed; any other endpoint needs the `ncm:write` scope, and without it the call returns an error asking the caller to acquire that scope — it does not run a step-up challenge. Only the curated write tools (`scopeChallenge` on registration) take the step-up path.
 
 ### Tool denylist
 
 `NCM_DISABLED_TOOLS` takes a comma-separated list of tool names and subtracts them from whatever `NCM_TOOLSETS` enables. A denied tool never appears in `tools/list` and has no registered handler, so calling it by name fails. Unknown names are ignored with a single startup warning rather than an error.
 
-When `NCM_DISABLED_TOOLS` is unset the default deny set is the account personal-info / session-identity group, exported as `DEFAULT_DISABLED_TOOLS` from `lib/config.ts` so it stays discoverable and testable:
+The default is **empty** (`DEFAULT_DISABLED_TOOLS` in `lib/config.ts`), because no curated tool touches account personal info or session identity — the curated set has nothing to ban. The switch exists so an operator can still hide wrappers they do not want, and it is exported so it stays discoverable and testable. Setting the variable replaces the default entirely; `NCM_DISABLED_TOOLS=` (empty) disables nothing.
 
-```
-ncm_account_profile, ncm_user_binding, ncm_vip_info, ncm_yunbei, ncm_user_level,
-ncm_user_counts, ncm_listen_stats, ncm_logout, ncm_daily_signin
-```
+All curated writes stay enabled by design: follow, like, comment, share, scrobble, cloud upload, and playlist create/delete/remove/add/reorder/rename.
 
-Setting the variable replaces that list entirely; `NCM_DISABLED_TOOLS=` (empty) disables nothing. Social, favorite and playlist writes — follow, like, comment, share, playlist create/delete/remove/add/reorder/rename — stay enabled.
+### Raw endpoint blocklist
 
-Trade-off worth stating plainly: the denylist gates the convenience wrappers, not the transport. `ncm_raw` can still reach the upstream endpoints behind a denied tool, and a caller holding `ncm:write` can use it for the same effect. That is accepted: the wrappers are what a model reaches for unprompted, and raw passthrough is the deliberate escape hatch.
+`ncm_raw` proxies upstream endpoints directly, so it was the route left to the two things the curated tool set deliberately never touches. `NCM_BLOCKED_RAW_ENDPOINTS` closes it, for exactly two reasons:
+
+**Identity mutation** — `user_update`, `avatar_upload`, `setting`, `user_social_status_edit`, `rebind`, `user_replacephone`, `user_bindingcellphone`, `activate_init_profile`, `nickname_check`, `logout`, `device_kickoff`, and every `login*`, `register*` and `captcha*` endpoint.
+
+**Spends money** — `dj_paygift` (radio gifting), `dj_toplist_pay` (paid chart placement), `yunbei_expense` (coin spend), `digitalAlbum_ordering` (digital album purchase).
+
+A blocked endpoint is rejected by name before any upstream call, and is omitted from `ncm_list_endpoints` (whose header reports how many are hidden).
+
+Everything else stays reachable: the playlist, comment, like, follow, share, scrobble and cloud-upload writes, `yunbei_sign`-style earns, the purchase *history* reads (`digitalAlbum_purchased`, `song_purchased`, `digitalAlbum_sales`, `yunbei`, `yunbei_info`, `yunbei_receipt`, `vip_*`), and the download-URL endpoints (`song_download_url`, `song_download_url_v1`, `song_cloud_download`), which return URLs without charging.
+
+Unset uses `DEFAULT_BLOCKED_RAW_ENDPOINTS` from `lib/config.ts`; a set variable replaces it, and `NCM_BLOCKED_RAW_ENDPOINTS=` blocks nothing.
+
+The trade-off, stated exactly: identity mutation and spending are blocked **only through `ncm_raw`**, and curated writes stay open by design. The two switches are independent — `NCM_DISABLED_TOOLS=` clears the (already empty) tool denylist and leaves the raw blocklist fully in force; only clearing `NCM_BLOCKED_RAW_ENDPOINTS` re-exposes those endpoints. And because the blocklist gates the transport, a tool name in `NCM_DISABLED_TOOLS` is still reachable through a *different* unblocked raw endpoint if one wraps the same upstream call — that is accepted, since `ncm_raw` is a deliberate escape hatch and the wrappers are what a model reaches for unprompted.
 
 ### Scopes
 
