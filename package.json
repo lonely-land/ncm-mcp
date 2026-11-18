@@ -1,0 +1,33 @@
+{
+  "name": "ncm-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Stateless NeteaseCloudMusic MCP server for Vercel with built-in OAuth 2.1 authorization server",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "e2e": "node scripts/oauth-e2e.mjs",
+    "smoke": "node scripts/tools-smoke.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.4.0",
+    "@neteasecloudmusicapienhanced/api": "4.41.1",
+    "jose": "^6.1.0",
+    "next": "16.4.6",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.1",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "regions": ["hkg1", "sin1"],
+  "functions": {
+    "app/mcp/route.ts": {
+      "maxDuration": 300
+    },
+    "app/authorize/route.ts": {
+      "maxDuration": 60
+    },
+    "app/token/route.ts": {
+      "maxDuration": 60
+    }
+  }
+}
