@@ -24,7 +24,23 @@ export async function callNcm(
   params: Record<string, unknown>,
   context: NcmCallContext = {},
 ): Promise<NcmCallResult> {
-  const api = ncmApi()
+  // Loading the package can itself fail (a missing native/side dependency in a
+  // serverless bundle), so it has to be inside the guard: an unhandled throw here
+  // surfaces to the client as an opaque 500 instead of a readable message.
+  let api
+  try {
+    api = ncmApi()
+  } catch (error) {
+    return {
+      ok: false,
+      status: 503,
+      body: {
+        code: 503,
+        message: `The NetEase client failed to load on this deployment: ${describeError(error)}`,
+      },
+    }
+  }
+
   const fn = api[endpoint]
   if (typeof fn !== 'function') {
     return {
@@ -34,7 +50,12 @@ export async function callNcm(
     }
   }
 
-  await bootstrapNcm()
+  try {
+    await bootstrapNcm()
+  } catch (error) {
+    // Bootstrap only prepares optional keys; a failure should degrade, not abort.
+    console.warn('[ncm] bootstrap failed:', describeError(error))
+  }
 
   const query: Record<string, unknown> = {
     ...params,
@@ -89,4 +110,9 @@ export async function callNcmStrict(
 
 export function fakeIpFor(request: Request): string | undefined {
   return resolveFakeIp(request)
+}
+
+function describeError(error: unknown): string {
+  if (error instanceof Error) return error.message
+  return String(error).slice(0, 200)
 }

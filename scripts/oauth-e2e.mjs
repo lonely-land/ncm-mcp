@@ -130,23 +130,37 @@ async function main() {
   authorizeUrl.searchParams.set('resource', `${BASE}/mcp`)
 
   const authorize = await fetch(authorizeUrl, { redirect: 'manual' })
-  const html = await authorize.text()
-  check('authorize renders the login page', authorize.status === 200, `status ${authorize.status}`)
-  check('page offers all three sign-in methods', ['QR code', 'SMS code', 'Password'].every((t) => html.includes(t)))
+  const loginLocation = authorize.headers.get('location') ?? ''
+  check('authorize redirects to the login UI', authorize.status === 307 && loginLocation.includes('/oauth/login'), `${authorize.status} ${loginLocation.slice(0, 80)}`)
   const setCookie = authorize.headers.get('set-cookie') ?? ''
   check('authorize seals the authz state in a cookie', setCookie.includes('ncm_authz='), setCookie.slice(0, 60))
   check('authz cookie is HttpOnly', /HttpOnly/i.test(setCookie))
   const authzCookie = setCookie.split(';')[0]
 
+  // The cookie is not visible to fetch() redirects, so follow the hop explicitly.
+  const loginHtml = await (
+    await fetch(new URL(loginLocation, BASE), { headers: { cookie: authzCookie } })
+  ).text()
+  check('login page renders the sign-in UI', loginHtml.includes('Sign in to NetEase Cloud Music'))
+  check('login page offers all three sign-in methods', ['QR code', 'SMS code', 'Password'].every((label) => loginHtml.includes(label)))
+
   const badResource = new URL(authorizeUrl)
   badResource.searchParams.set('resource', 'https://evil.example.com/mcp')
   const badResourceResponse = await fetch(badResource, { redirect: 'manual' })
-  check('authorize rejects a foreign resource', badResourceResponse.status === 400, `status ${badResourceResponse.status}`)
+  check(
+    'authorize rejects a foreign resource',
+    badResourceResponse.status === 307 && (badResourceResponse.headers.get('location') ?? '').includes('error=invalid_target'),
+    `${badResourceResponse.status} ${badResourceResponse.headers.get('location')?.slice(0, 90)}`,
+  )
 
   const noPkce = new URL(authorizeUrl)
   noPkce.searchParams.delete('code_challenge')
   const noPkceResponse = await fetch(noPkce, { redirect: 'manual' })
-  check('authorize requires PKCE', noPkceResponse.status === 400, `status ${noPkceResponse.status}`)
+  check(
+    'authorize requires PKCE',
+    noPkceResponse.status === 307 && (noPkceResponse.headers.get('location') ?? '').includes('error=invalid_request'),
+    `${noPkceResponse.status} ${noPkceResponse.headers.get('location')?.slice(0, 90)}`,
+  )
 
   section('5. Login completion')
   // A real NetEase session requires a human (QR scan or credentials). The default
