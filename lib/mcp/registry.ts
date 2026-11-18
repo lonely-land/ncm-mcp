@@ -4,14 +4,36 @@ import * as z from 'zod'
 import { callNcm } from '@/lib/ncm/client'
 import type { CookieJar } from '@/lib/ncm/cookies'
 import {
+  TEXT_LIMITS,
+  capText,
+  capTextFields,
   slimComment,
   slimPlaylist,
   slimSong,
   slimUser,
   toToolText,
+  toToolTextKeepingTail,
   trimGeneric,
   trimText,
 } from '@/lib/ncm/serialize'
+import {
+  DEFAULT_PAGE_SIZE,
+  MAX_PAGE_SIZE,
+  findDominantArray,
+  localFetchLimit,
+  pageMeta,
+  pageRequest,
+  pagingEmptyNote,
+  pagingFooter,
+  pagingShape,
+  paginate,
+  paginateGroups,
+  upstreamWindow,
+  type GroupSpec,
+  type PageMeta,
+  type PagedGroup,
+  type PagingMode,
+} from '@/lib/mcp/pagination'
 
 export interface ToolRuntime {
   jar: CookieJar
@@ -41,6 +63,13 @@ export interface ToolDef {
   mapArgs?: (args: any, runtime: ToolRuntime) => Record<string, unknown>
   /** Transform the upstream body into the text returned to the model. */
   render?: (body: any, args: any) => string
+  /**
+   * Which arrays in the upstream body are paged, and how the upstream is called:
+   * - `offset`: send limit+offset, the array holds exactly the requested page
+   * - `limit`:  send limit only (up to the end of the page), slice locally
+   * - `local`:  the endpoint returns everything, slice locally
+   */
+  paging?: ToolPaging
   requiresWrite?: boolean
   requiresLogin?: boolean
 }
@@ -70,10 +99,61 @@ const READ_ONLY: ToolAnnotations = { readOnlyHint: true, openWorldHint: true }
 const WRITE: ToolAnnotations = { readOnlyHint: false, destructiveHint: false, openWorldHint: true }
 const DESTRUCTIVE: ToolAnnotations = { readOnlyHint: false, destructiveHint: true, openWorldHint: true }
 
-const paging = {
-  limit: z.number().int().min(1).max(100).optional().describe('Page size, 1-100'),
-  offset: z.number().int().min(0).optional().describe('Offset for paging'),
+const paging = pagingShape
+
+/** How a tool's arrays are paged. */
+export interface ToolPaging {
+  /**
+   * Arrays to page. Leave empty to auto-detect the dominant array, which is the
+   * right choice for endpoints whose shape is not worth pinning down.
+   */
+  groups: GroupSpec[]
+  /**
+   * How the upstream is asked. Default 'local' — the safe choice, because slicing
+   * a full response cannot drop data. Use 'offset' only when the endpoint honours
+   * limit/offset on the arrays being paged.
+   */
+  mode?: PagingMode
+  defaultPageSize?: number
 }
+
+/** Page params for an endpoint that takes limit/offset, or just limit. */
+function upstreamParams(def: ToolDef, args: any): Record<string, unknown> {
+  const pagingDef = def.paging
+  if (!pagingDef) return {}
+  const req = pageRequest(args, pagingDef.defaultPageSize)
+  const mode = pagingDef.mode ?? 'local'
+  if (mode === 'local') return {}
+  if (mode === 'limit') return { limit: localFetchLimit(req) }
+  return upstreamWindow(req)
+}
+
+/** page/pageSize are ours, not the upstream's; never leak them into a request. */
+function stripPagingArgs(params: Record<string, unknown>): Record<string, unknown> {
+  if (!('page' in params) && !('pageSize' in params)) return params
+  const { page: _page, pageSize: _pageSize, ...rest } = params
+  return rest
+}
+
+/** Page the arrays named by `def.paging` and collect their metadata. */
+function pageResultBody(def: ToolDef, body: any, args: any): { body: any; groups: PagedGroup[] } {
+  const pagingDef = def.paging
+  if (!pagingDef) return { body, groups: [] }
+  return paginateGroups(body, pagingDef.groups, args, {
+    mode: pagingDef.mode ?? 'local',
+    defaultPageSize: pagingDef.defaultPageSize,
+  })
+}
+
+/** Cap on one free-form text field, tunable per call, for lyrics and long descriptions. */
+const maxChars = z
+  .number()
+  .int()
+  .optional()
+  .describe(
+    `Maximum characters kept from each long text field (default ${TEXT_LIMITS.lyrics}); ` +
+      'anything longer is cut and the result says how much was dropped.',
+  )
 
 const commentType = z
   .enum(['song', 'mv', 'playlist', 'album', 'dj', 'video', 'event'])
@@ -111,9 +191,10 @@ const SEARCH_TYPE_CODE: Record<string, number> = {
   complex: 1018,
 }
 
-/** Default runner: endpoint call, generic trim, JSON text. */
+/** Default runner: endpoint call, paging, generic trim, JSON text. */
 async function defaultRun(def: ToolDef, args: any, runtime: ToolRuntime): Promise<ToolResult> {
-  const params = def.mapArgs ? def.mapArgs(args, runtime) : { ...args }
+  const mapped = def.mapArgs ? def.mapArgs(args, runtime) : { ...args }
+  const params = { ...stripPagingArgs(mapped), ...upstreamParams(def, args) }
   const result = await callNcm(def.endpoint!, params, {
     jar: runtime.jar,
     fakeIp: runtime.fakeIp,
@@ -157,12 +238,18 @@ async function defaultRun(def: ToolDef, args: any, runtime: ToolRuntime): Promis
     }
   }
 
-  const text = def.render
-    ? def.render(result.body, args)
-    : toToolText(trimGeneric(result.body))
+  const paged = pageResultBody(def, result.body, args)
+  if (def.render) {
+    const text = def.render(paged.body, args)
+    return { content: [{ type: 'text', text: `${text}${pagingFooter(paged.groups)}` }] }
+  }
+  // Keep the paging object in view even when a verbose payload hits the ceiling.
+  const text = toToolTextKeepingTail(
+    capTextFields(trimGeneric(paged.body), TEXT_LIMITS.field),
+    TEXT_LIMITS.result,
+  )
   return { content: [{ type: 'text', text }] }
 }
-
 export async function runTool(
   def: ToolDef,
   args: any,
@@ -204,6 +291,17 @@ function renderSongList(songs: any[], heading: string): string {
   if (!songs.length) return `${heading}\n(no songs)`
   return `${heading}\n${songs.map(songLine).join('\n')}`
 }
+
+/**
+ * Note for an empty rendered page. Uses the paging metadata stitched onto the body
+ * by `paginateGroups`, so "page 9 is past the end" reads differently from "none".
+ */
+function emptyPageNote(body: any, path: string, unit: string): string {
+  const meta = body?.paging?.[path] as PageMeta | undefined
+  if (!meta) return `(no ${unit})`
+  return pagingEmptyNote(meta, unit)
+}
+
 
 // ---------------------------------------------------------------------------
 // account
@@ -282,26 +380,33 @@ const accountTools: ToolDef[] = [
     name: 'ncm_user_follows',
     toolset: 'account',
     title: 'Following list',
-    description: 'Users the given account follows.',
+    description:
+      'Users the given account follows. Paged: pass page (1-based, default 1) and pageSize ' +
+      `(default ${DEFAULT_PAGE_SIZE}, clamped to ${MAX_PAGE_SIZE}). The paging footer says how many ` +
+      'users came back and whether more exist.',
     input: z.object({
       uid: z.union([z.string(), z.number()]).describe('User id; use ncm_account_status for your own'),
       ...paging,
     }),
     annotations: READ_ONLY,
     endpoint: 'user_follows',
+    paging: { mode: 'offset', groups: [{ path: 'follow', label: 'users' }] },
     render: (body) => renderUserList(body?.follow ?? [], 'Following'),
   },
   {
     name: 'ncm_user_followeds',
     toolset: 'account',
     title: 'Follower list',
-    description: 'Users following the given account.',
+    description:
+      'Users following the given account. Paged: page (1-based, default 1) and pageSize ' +
+      `(default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}); the footer reports counts and hasMore.`,
     input: z.object({
       uid: z.union([z.string(), z.number()]).describe('User id'),
       ...paging,
     }),
     annotations: READ_ONLY,
     endpoint: 'user_followeds',
+    paging: { mode: 'offset', groups: [{ path: 'followeds', label: 'users' }] },
     render: (body) => renderUserList(body?.followeds ?? [], 'Followers'),
   },
   {
@@ -349,6 +454,24 @@ function renderUserList(users: any[], heading: string): string {
     .join('\n')}`
 }
 
+/**
+ * One paged request for the search family. The upstream takes limit/offset and
+ * applies them to every result kind at once, so the returned arrays already are
+ * the page; each kind keeps its reported count as `total`.
+ */
+const searchPaging: ToolPaging = {
+  mode: 'offset',
+  groups: [
+    { path: 'result.songs', label: 'songs', totalPath: 'result.songCount' },
+    { path: 'result.albums', label: 'albums', totalPath: 'result.albumCount' },
+    { path: 'result.artists', label: 'artists', totalPath: 'result.artistCount' },
+    { path: 'result.playlists', label: 'playlists', totalPath: 'result.playlistCount' },
+    { path: 'result.users', label: 'users', totalPath: 'result.userCount' },
+    { path: 'result.mvs', label: 'MVs', totalPath: 'result.mvCount' },
+    { path: 'result.djRadios', label: 'radio', totalPath: 'result.djRadiosCount' },
+  ],
+}
+
 // ---------------------------------------------------------------------------
 // search
 // ---------------------------------------------------------------------------
@@ -360,7 +483,9 @@ const searchTools: ToolDef[] = [
     title: 'Search music',
     description:
       'Search NetEase for songs, albums, artists, playlists, users, MV, lyrics or radio. ' +
-      'Returns a compact list with ids you can pass to the detail tools.',
+      'Returns a compact list with ids you can pass to the detail tools. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}) ` +
+      'apply to every result kind at once; the footer reports each kind\'s total and hasMore.',
     input: z.object({
       keywords: z.string().min(1).describe('Query text'),
       type: searchType,
@@ -371,16 +496,18 @@ const searchTools: ToolDef[] = [
     mapArgs: (args) => ({
       keywords: args.keywords,
       ...(args.type ? { type: SEARCH_TYPE_CODE[args.type] } : {}),
-      ...(args.limit ? { limit: args.limit } : {}),
-      ...(args.offset ? { offset: args.offset } : {}),
     }),
+    paging: searchPaging,
     render: (body, args) => renderSearch(body?.result ?? {}, args.type),
   },
   {
     name: 'ncm_search_cloud',
     toolset: 'search',
     title: 'Search (cloud index)',
-    description: 'Search against the cloud index, which has better coverage for niche and new releases.',
+    description:
+      'Search against the cloud index, which has better coverage for niche and new releases. ' +
+      `Paged like ncm_search: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, ` +
+      `max ${MAX_PAGE_SIZE}), applied to every result kind.`,
     input: z.object({
       keywords: z.string().min(1),
       type: searchType,
@@ -391,19 +518,21 @@ const searchTools: ToolDef[] = [
     mapArgs: (args) => ({
       keywords: args.keywords,
       ...(args.type ? { type: SEARCH_TYPE_CODE[args.type] } : {}),
-      ...(args.limit ? { limit: args.limit } : {}),
-      ...(args.offset ? { offset: args.offset } : {}),
     }),
+    paging: searchPaging,
     render: (body, args) => renderSearch(body?.result ?? {}, args.type),
   },
   {
     name: 'ncm_search_suggest',
     toolset: 'search',
     title: 'Search suggestions',
-    description: 'Autocomplete suggestions for a partial query.',
-    input: z.object({ keywords: z.string().min(1) }),
+    description:
+      'Autocomplete suggestions for a partial query. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
+    input: z.object({ keywords: z.string().min(1), ...paging }),
     annotations: READ_ONLY,
     endpoint: 'search_suggest',
+    paging: { groups: [{ path: 'result.allMatch', label: 'suggestions' }] },
     render: (body) =>
       (body?.result?.allMatch ?? []).map((entry: any) => `- ${entry.keyword}`).join('\n') ||
       '(no suggestions)',
@@ -412,8 +541,13 @@ const searchTools: ToolDef[] = [
     name: 'ncm_search_hot',
     toolset: 'search',
     title: 'Trending searches',
-    description: 'Current hot search keywords on NetEase.',
-    input: z.object({ detail: z.boolean().optional().describe('Include trending topic details') }),
+    description:
+      'Current hot search keywords on NetEase. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
+    input: z.object({
+      detail: z.boolean().optional().describe('Include trending topic details'),
+      ...paging,
+    }),
     annotations: READ_ONLY,
     endpoint: 'search_hot',
     run: async (args, runtime) => {
@@ -424,46 +558,72 @@ const searchTools: ToolDef[] = [
       if (!result.ok) return { isError: true, content: [{ type: 'text', text: 'Hot search unavailable' }] }
       const source = result.body?.data ?? result.body?.result ?? result.body
       const list = Array.isArray(source) ? source : (source?.hots ?? source?.data ?? [])
-      return {
-        content: [
-          {
-            type: 'text',
-            text:
-              list
-                .slice(0, 40)
-                .map((entry: any, index: number) => `${index + 1}. ${entry.first ?? entry.searchWord ?? entry.keyword}`)
-                .join('\n') || JSON.stringify(trimGeneric(result.body), null, 2),
-          },
-        ],
-      }
+      const { items, meta } = paginate(list, args)
+      const group: PagedGroup = { label: 'keywords', path: 'hots', unit: 'keywords', meta }
+      const text =
+        items
+          .map(
+            (entry: any, index: number) =>
+              `${meta.offset + index + 1}. ${entry.first ?? entry.searchWord ?? entry.keyword}`,
+          )
+          .join('\n') || pagingEmptyNote(meta, 'keywords')
+      return { content: [{ type: 'text', text: `${text}${pagingFooter([group])}` }] }
     },
   },
   {
     name: 'ncm_search_multimatch',
     toolset: 'search',
     title: 'Multi-match search',
-    description: 'Search across multiple result kinds in one call and get ids for each match.',
+    description:
+      'Search across multiple result kinds in one call and get ids for each match. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}) ` +
+      'slice the busiest result array; the rest of the payload is kept.',
     input: z.object({
       keywords: z.string().min(1),
       type: z.number().int().min(1).max(100).optional().describe('Result kind bitmask; default 1 (songs)'),
+      ...paging,
     }),
     annotations: READ_ONLY,
     endpoint: 'search_multimatch',
+    paging: { groups: [], mode: 'local' },
   },
   {
     name: 'ncm_search_default',
     toolset: 'search',
     title: 'Default search landing',
-    description: 'The default discovery payload NetEase shows on an empty search box.',
+    description:
+      'The default discovery payload NetEase shows on an empty search box. This is a single ' +
+      'suggested query plus ranking hints, not a list, so it takes no page parameters; long ' +
+      `hint fields are capped at ${TEXT_LIMITS.field} characters.`,
     input: z.object({}),
     annotations: READ_ONLY,
     endpoint: 'search_default',
+    render: (body) => {
+      const data = body?.data ?? body ?? {}
+      const lines = [
+        `suggested query: ${data.showKeyword ?? data.realkeyword ?? '(none)'}`,
+        ...(data.styleKeyword?.keyWord ? [`styled: ${data.styleKeyword.keyWord}`] : []),
+        ...(data.realkeyword ? [`search term: ${data.realkeyword}`] : []),
+        ...(data.searchType !== undefined ? [`search type: ${data.searchType}`] : []),
+      ]
+      const rest = { ...data }
+      delete rest.showKeyword
+      delete rest.styleKeyword
+      delete rest.realkeyword
+      delete rest.searchType
+      const tail = Object.keys(rest).length
+        ? `\n${toToolText(capTextFields(trimGeneric(rest), TEXT_LIMITS.field), TEXT_LIMITS.result)}`
+        : ''
+      return `${lines.join('\n')}${tail}`
+    },
   },
   {
     name: 'ncm_search_lyric',
     toolset: 'search',
     title: 'Search by lyric',
-    description: 'Find songs whose lyrics match a phrase.',
+    description:
+      'Find songs whose lyrics match a phrase. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
     input: z.object({
       keywords: z.string().min(1),
       ...paging,
@@ -473,35 +633,33 @@ const searchTools: ToolDef[] = [
     mapArgs: (args) => ({
       keywords: args.keywords,
       type: SEARCH_TYPE_CODE.lyric,
-      ...(args.limit ? { limit: args.limit } : {}),
-      ...(args.offset ? { offset: args.offset } : {}),
     }),
-    render: (body) => {
-      const songs = body?.result?.songs ?? []
-      return renderSongList(songs.map(slimSong), 'Lyric matches')
+    paging: {
+      mode: 'offset',
+      groups: [{ path: 'result.songs', label: 'songs', totalPath: 'result.songCount' }],
     },
+    render: (body) => renderSongList((body?.result?.songs ?? []).map(slimSong), 'Lyric matches'),
   },
   {
     name: 'ncm_search_song_page',
     toolset: 'search',
     title: 'Search song page',
-    description: 'Paged song-only search results, cheaper than a mixed search when you only need songs.',
+    description:
+      'Song-only search results, cheaper than a mixed search when you only need songs. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
     input: z.object({
-      keywords: z.string().min(1),
-      page: z.number().int().min(1).max(100).optional().describe('1-based page number, default 1'),
-      pageSize: z.number().int().min(1).max(100).optional().describe('Songs per page, default 20'),
+      keywords: z.string().min(1).describe('Query text'),
+      ...paging,
     }),
     annotations: READ_ONLY,
     endpoint: 'search',
-    mapArgs: (args) => {
-      const pageSize = args.pageSize ?? 20
-      const page = args.page ?? 1
-      return {
-        keywords: args.keywords,
-        type: SEARCH_TYPE_CODE.song,
-        limit: pageSize,
-        offset: (page - 1) * pageSize,
-      }
+    mapArgs: (args) => ({
+      keywords: args.keywords,
+      type: SEARCH_TYPE_CODE.song,
+    }),
+    paging: {
+      mode: 'offset',
+      groups: [{ path: 'result.songs', label: 'songs', totalPath: 'result.songCount' }],
     },
     render: (body) => renderSongList((body?.result?.songs ?? []).map(slimSong), 'Songs'),
   },
@@ -515,16 +673,12 @@ function renderSearch(result: any, type?: string): string {
   }
   if (result.albums?.length) {
     lines.push(
-      `Albums\n${result.albums
-        .slice(0, 20)
-        .map((a: any) => `- ${a.name} — ${a.artist?.name ?? ''} id=${a.id}`)
-        .join('\n')}`,
+      `Albums\n${result.albums.map((a: any) => `- ${a.name} — ${a.artist?.name ?? ''} id=${a.id}`).join('\n')}`,
     )
   }
   if (result.artists?.length) {
     lines.push(
       `Artists\n${result.artists
-        .slice(0, 20)
         .map((a: any) => `- ${a.name}${a.alias?.length ? ` (${a.alias.join(', ')})` : ''} id=${a.id}`)
         .join('\n')}`,
     )
@@ -532,7 +686,6 @@ function renderSearch(result: any, type?: string): string {
   if (result.playlists?.length) {
     lines.push(
       `Playlists\n${result.playlists
-        .slice(0, 20)
         .map((p: any) => `- ${p.name} — ${p.trackCount ?? '?'} tracks id=${p.id}`)
         .join('\n')}`,
     )
@@ -541,17 +694,10 @@ function renderSearch(result: any, type?: string): string {
     lines.push(renderUserList(result.users, 'Users'))
   }
   if (result.mvs?.length) {
-    lines.push(
-      `Music videos\n${result.mvs.slice(0, 20).map((m: any) => `- ${m.name} id=${m.id}`).join('\n')}`,
-    )
+    lines.push(`Music videos\n${result.mvs.map((m: any) => `- ${m.name} id=${m.id}`).join('\n')}`)
   }
   if (result.djRadios?.length) {
-    lines.push(
-      `Radio\n${result.djRadios
-        .slice(0, 20)
-        .map((d: any) => `- ${d.name} id=${d.id}`)
-        .join('\n')}`,
-    )
+    lines.push(`Radio\n${result.djRadios.map((d: any) => `- ${d.name} id=${d.id}`).join('\n')}`)
   }
   return lines.join('\n\n') || '(no results)'
 }
@@ -565,10 +711,13 @@ const discoverTools: ToolDef[] = [
     name: 'ncm_personalized',
     toolset: 'discover',
     title: 'Recommended playlists',
-    description: 'Personalised playlist recommendations for the current session.',
-    input: z.object({ limit: z.number().int().min(1).max(50).optional() }),
+    description:
+      'Personalised playlist recommendations for the current session. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
+    input: z.object({ ...paging }),
     annotations: READ_ONLY,
     endpoint: 'personalized',
+    paging: { mode: 'limit', groups: [{ path: 'result', label: 'playlists' }] },
     render: (body) =>
       (body?.result ?? [])
         .map((p: any) => `- ${p.name} — ${p.trackCount ?? '?'} tracks id=${p.id}`)
@@ -580,10 +729,12 @@ const discoverTools: ToolDef[] = [
     title: 'Daily recommendations',
     description:
       'The daily recommended song list ("每日推荐"). Gives a personal list when logged in, a generic ' +
-      'one otherwise.',
-    input: z.object({}),
+      `one otherwise. Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, ` +
+      `max ${MAX_PAGE_SIZE}).`,
+    input: z.object({ ...paging }),
     annotations: READ_ONLY,
     endpoint: 'recommend_songs',
+    paging: { mode: 'local', groups: [{ path: 'data.dailySongs', label: 'songs' }] },
     render: (body) => {
       const songs = body?.data?.dailySongs ?? body?.recommend ?? []
       return renderSongList(songs.map(slimSong), 'Daily recommendations')
@@ -593,10 +744,13 @@ const discoverTools: ToolDef[] = [
     name: 'ncm_recommend_resource',
     toolset: 'discover',
     title: 'Recommended resources',
-    description: 'Mixed recommended resources: playlists, radio and albums.',
-    input: z.object({}),
+    description:
+      'Mixed recommended resources: playlists, radio and albums. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
+    input: z.object({ ...paging }),
     annotations: READ_ONLY,
     endpoint: 'recommend_resource',
+    paging: { mode: 'local', groups: [{ path: 'recommend', label: 'resources' }] },
     render: (body) =>
       (body?.recommend ?? [])
         .map((r: any) => `- ${r.name} (${r.type}) id=${r.id}`)
@@ -606,23 +760,30 @@ const discoverTools: ToolDef[] = [
     name: 'ncm_new_songs',
     toolset: 'discover',
     title: 'New releases',
-    description: 'Newly released songs, per region.',
+    description:
+      'Newly released songs, per region. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}); ` +
+      'the upstream caps this feed at 100 songs.',
     input: z.object({
       area: z.enum(['ALL', 'ZH', 'EA', 'KR', 'JP']).optional().describe('Region, default ALL'),
-      limit: z.number().int().min(1).max(100).optional(),
+      ...paging,
     }),
     annotations: READ_ONLY,
     endpoint: 'personalized_newsong',
+    paging: { mode: 'limit', groups: [{ path: 'result', label: 'songs' }] },
     render: (body) => renderSongList((body?.result ?? []).map(slimSong), 'New songs'),
   },
   {
     name: 'ncm_toplist',
     toolset: 'discover',
     title: 'All toplists',
-    description: 'Every NetEase chart: soars, new songs, originals, and the global top 500.',
-    input: z.object({}),
+    description:
+      'Every NetEase chart: soars, new songs, originals, and the global top 500. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
+    input: z.object({ ...paging }),
     annotations: READ_ONLY,
     endpoint: 'toplist',
+    paging: { mode: 'local', groups: [{ path: 'list', label: 'toplists' }] },
     render: (body) =>
       (body?.list ?? [])
         .map((l: any) => `- ${l.name} id=${l.id}${l.updateFrequency ? ` (${l.updateFrequency})` : ''}`)
@@ -632,10 +793,14 @@ const discoverTools: ToolDef[] = [
     name: 'ncm_toplist_detail',
     toolset: 'discover',
     title: 'Toplist summaries',
-    description: 'Summary of every toplist with its top tracks.',
-    input: z.object({}),
+    description:
+      'Summary of every toplist with its top tracks. ' +
+      `Paged over the toplists (page 1-based default 1, pageSize default ${DEFAULT_PAGE_SIZE}, ` +
+      `max ${MAX_PAGE_SIZE}); each toplist keeps its first 3 tracks as a preview.`,
+    input: z.object({ ...paging }),
     annotations: READ_ONLY,
     endpoint: 'toplist_detail_v2',
+    paging: { mode: 'local', groups: [{ path: 'list', label: 'toplists' }] },
     render: (body) =>
       (body?.list ?? [])
         .map(
@@ -648,7 +813,10 @@ const discoverTools: ToolDef[] = [
     name: 'ncm_toplist_songs',
     toolset: 'discover',
     title: 'Toplist tracks',
-    description: 'Full track list of one toplist, newest first.',
+    description:
+      'Track list of one toplist, newest first. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}); ` +
+      'the footer reports the toplist total and hasMore.',
     input: z.object({
       id: z.union([z.string(), z.number()]).describe('Toplist id from ncm_toplist'),
       ...paging,
@@ -656,6 +824,10 @@ const discoverTools: ToolDef[] = [
     annotations: READ_ONLY,
     endpoint: 'playlist_detail',
     mapArgs: (args) => ({ id: args.id }),
+    paging: {
+      mode: 'local',
+      groups: [{ path: 'playlist.tracks', label: 'tracks', totalPath: 'playlist.trackCount' }],
+    },
     render: (body) => {
       const tracks = body?.playlist?.tracks ?? []
       const total = body?.playlist?.trackCount
@@ -666,15 +838,19 @@ const discoverTools: ToolDef[] = [
     name: 'ncm_banner',
     toolset: 'discover',
     title: 'Banners',
-    description: 'Home page promotional banners.',
+    description:
+      'Home page promotional banners. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
     input: z.object({
       type: z.enum(['pc', 'android', 'iphone', 'ipad']).optional(),
+      ...paging,
     }),
     annotations: READ_ONLY,
     endpoint: 'banner',
     mapArgs: (args) => ({
       type: ({ pc: 0, android: 1, iphone: 2, ipad: 3 } as Record<string, number>)[args.type ?? 'pc'],
     }),
+    paging: { mode: 'local', groups: [{ path: 'banners', label: 'banners' }] },
     render: (body) =>
       (body?.banners ?? []).map((b: any) => `- ${b.typeTitle ?? b.song?.name ?? b.url}`).join('\n') || '(none)',
   },
@@ -682,20 +858,25 @@ const discoverTools: ToolDef[] = [
     name: 'ncm_top_songs',
     toolset: 'discover',
     title: 'Top songs by region',
-    description: 'Regional charts of the most played songs.',
-    input: z.object({ area: z.enum(['all', 'zh', 'ea', 'kr', 'ja']).optional() }),
+    description:
+      'Regional charts of the most played songs. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
+    input: z.object({ area: z.enum(['all', 'zh', 'ea', 'kr', 'ja']).optional(), ...paging }),
     annotations: READ_ONLY,
     endpoint: 'top_song',
     mapArgs: (args) => ({
       type: ({ all: 0, zh: 7, ea: 96, kr: 16, ja: 8 } as Record<string, number>)[args.area ?? 'all'],
     }),
+    paging: { mode: 'local', groups: [{ path: 'data', label: 'songs' }] },
     render: (body) => renderSongList((body?.data ?? []).map(slimSong), 'Top songs'),
   },
   {
     name: 'ncm_top_playlists',
     toolset: 'discover',
     title: 'Top playlists',
-    description: 'Popular playlists, optionally by category.',
+    description:
+      'Popular playlists, optionally by category. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
     input: z.object({
       cat: z.string().optional().describe('Category name, e.g. 华语 / 摇滚 / 电子'),
       order: z.enum(['hot', 'new']).optional(),
@@ -703,38 +884,50 @@ const discoverTools: ToolDef[] = [
     }),
     annotations: READ_ONLY,
     endpoint: 'top_playlist',
+    paging: { mode: 'offset', groups: [{ path: 'playlists', label: 'playlists' }] },
   },
   {
     name: 'ncm_top_artists',
     toolset: 'discover',
     title: 'Top artists',
-    description: 'Most popular artists on the platform.',
+    description:
+      'Most popular artists on the platform. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
     input: z.object({ ...paging }),
     annotations: READ_ONLY,
     endpoint: 'top_artists',
+    paging: { mode: 'offset', groups: [{ path: 'artists', label: 'artists' }] },
   },
   {
     name: 'ncm_music_calendar',
     toolset: 'discover',
     title: 'Release calendar',
-    description: 'Albums and singles released in a date range.',
+    description:
+      'Albums and singles released in a date range. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}) ` +
+      'walk the days of the range; each day keeps at most 20 releases.',
     input: z.object({
       startTime: z.union([z.string(), z.number()]).describe('Start of range in epoch ms'),
       endTime: z.union([z.string(), z.number()]).describe('End of range in epoch ms'),
+      ...paging,
     }),
     annotations: READ_ONLY,
     endpoint: 'calendar',
-    render: (body) => {
+    render: (body, args) => {
       const days = Object.entries(body?.data ?? {}) as [string, any][]
       if (!days.length) return '(nothing released in range)'
-      return days
+      const { items, meta } = paginate(days, args)
+      const group = { label: 'days', path: 'data', unit: 'days', meta }
+      const text = items
         .map(
           ([day, payload]) =>
             `${day}\n${(payload?.newAlbums ?? [])
+              .slice(0, 20)
               .map((a: any) => `  · ${a.name} — ${a.artist?.name ?? ''} id=${a.id}`)
               .join('\n')}`,
         )
         .join('\n')
+      return `${text}${pagingFooter([group])}`
     },
   },
 ]
@@ -750,12 +943,16 @@ const musicTools: ToolDef[] = [
     title: 'Song detail',
     description:
       'Metadata for one or more songs (comma-separated ids): title, artists, album, duration, ' +
-      'publish time and whether a play URL is available.',
+      'publish time and whether a play URL is available. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}) ` +
+      'slice the songs in the order you listed the ids.',
     input: z.object({
       ids: z.string().describe('Comma-separated song ids, e.g. "347230,186016"'),
+      ...paging,
     }),
     annotations: READ_ONLY,
     endpoint: 'song_detail',
+    paging: { mode: 'local', groups: [{ path: 'songs', label: 'songs' }] },
     render: (body) => {
       const songs = (body?.songs ?? []).map(slimSong)
       const rights = (body?.privileges ?? []) as { id: number; st: number }[]
@@ -774,18 +971,23 @@ const musicTools: ToolDef[] = [
     title: 'Song play URL',
     description:
       'Resolve a playable audio URL at a chosen quality tier. Unavailable songs come back with an ' +
-      'empty url and a `code` explaining the reason (region lock or VIP requirement).',
+      'empty url and a `code` explaining the reason (region lock or VIP requirement). ' +
+      `Paged over the ids you pass: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, ` +
+      `max ${MAX_PAGE_SIZE}).`,
     input: z.object({
       ids: z.string().describe('Comma-separated song ids'),
       level: quality.optional(),
+      ...paging,
     }),
     annotations: READ_ONLY,
     endpoint: 'song_url_v1',
     run: async (args, runtime) => {
-      const ids = String(args.ids)
+      const allIds = String(args.ids)
         .split(',')
         .map((id) => id.trim())
         .filter(Boolean)
+      const { items: ids, meta } = paginate(allIds, args)
+      const group: PagedGroup = { label: 'ids', path: 'ids', unit: 'ids', meta }
 
       // song_url_v1 takes one id at a time, so fan out and join.
       const settled = await Promise.all(
@@ -810,7 +1012,8 @@ const musicTools: ToolDef[] = [
           `- id=${ids[index]} ${entry.level ?? args.level ?? ''} ${sizeMb ? `${sizeMb}MB ` : ''}${entry.type ?? ''}\n  ${entry.url}`,
         )
       }
-      return { content: [{ type: 'text', text: lines.join('\n') || '(nothing resolved)' }] }
+      const text = lines.join('\n') || pagingEmptyNote(meta, 'ids')
+      return { content: [{ type: 'text', text: `${text}${pagingFooter([group])}` }] }
     },
   },
   {
@@ -834,22 +1037,33 @@ const musicTools: ToolDef[] = [
     name: 'ncm_lyric',
     toolset: 'music',
     title: 'Lyrics',
-    description: 'Plain and translated lyrics plus the LRC timestamped version.',
+    description:
+      'Plain and translated lyrics plus the optional LRC timestamped version. Each block is capped at ' +
+      `maxChars characters (default ${TEXT_LIMITS.lyrics}) and says how much was cut, so one call cannot ` +
+      'flood the context; raise maxChars when you need the whole song.',
     input: z.object({
       id: z.union([z.string(), z.number()]),
       includeLrc: z.boolean().optional().describe('Include raw LRC with timestamps'),
       includeTranslation: z.boolean().optional().describe('Include the translated lyrics'),
+      maxChars: maxChars.describe(
+        `Maximum characters kept from each lyrics block (default ${TEXT_LIMITS.lyrics}); ` +
+          'blocks longer than this are cut and marked truncated.',
+      ),
     }),
     annotations: READ_ONLY,
     endpoint: 'lyric',
     render: (body, args) => {
+      const limit = typeof args.maxChars === 'number' && args.maxChars > 0 ? Math.trunc(args.maxChars) : TEXT_LIMITS.lyrics
       const parts: string[] = []
-      if (body?.lrc?.lyric) parts.push(args.includeLrc ? body.lrc.lyric : stripLrcTimestamps(body.lrc.lyric))
+      if (body?.lrc?.lyric) {
+        const raw = args.includeLrc ? body.lrc.lyric : stripLrcTimestamps(body.lrc.lyric)
+        parts.push(`--- lyrics ---\n${capText(raw, limit)}`)
+      }
       if (args.includeTranslation !== false && body?.tlyric?.lyric) {
-        parts.push(`--- translation ---\n${stripLrcTimestamps(body.tlyric.lyric)}`)
+        parts.push(`--- translation ---\n${capText(stripLrcTimestamps(body.tlyric.lyric), limit)}`)
       }
       if (body?.romalrc?.lyric && args.includeTranslation !== false) {
-        parts.push(`--- romanised ---\n${stripLrcTimestamps(body.romalrc.lyric)}`)
+        parts.push(`--- romanised ---\n${capText(stripLrcTimestamps(body.romalrc.lyric), limit)}`)
       }
       if (body?.nolyric) parts.push('(instrumental, no lyrics)')
       return parts.join('\n\n') || '(no lyrics available)'
@@ -859,29 +1073,54 @@ const musicTools: ToolDef[] = [
     name: 'ncm_lyric_mark',
     toolset: 'music',
     title: 'Lyric highlights',
-    description: 'Curated "lyric marks" (highlighted lines) for a song.',
-    input: z.object({ id: z.union([z.string(), z.number()]) }),
+    description:
+      'Curated "lyric marks" (highlighted lines) for a song. Long fields are capped at ' +
+      `maxChars characters (default ${TEXT_LIMITS.lyricMark}) and marked when truncated.`,
+    input: z.object({
+      id: z.union([z.string(), z.number()]),
+      maxChars: maxChars.describe(
+        `Maximum characters kept from each text field (default ${TEXT_LIMITS.lyricMark}).`,
+      ),
+    }),
     annotations: READ_ONLY,
     endpoint: 'song_lyrics_mark',
+    render: (body, args) => {
+      const limit =
+        typeof args.maxChars === 'number' && args.maxChars > 0 ? Math.trunc(args.maxChars) : TEXT_LIMITS.lyricMark
+      return toToolText(capTextFields(trimGeneric(body), limit), TEXT_LIMITS.result)
+    },
   },
   {
     name: 'ncm_similar_songs',
     toolset: 'music',
     title: 'Similar songs',
-    description: 'Songs musically similar to the given one.',
+    description:
+      'Songs musically similar to the given one. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
     input: z.object({ id: z.union([z.string(), z.number()]), ...paging }),
     annotations: READ_ONLY,
     endpoint: 'simi_song',
+    paging: {
+      mode: 'offset',
+      groups: [{ path: 'songs', label: 'songs' }],
+    },
     render: (body) => renderSongList((body?.songs ?? []).map(slimSong), 'Similar songs'),
   },
   {
     name: 'ncm_song_creators',
     toolset: 'music',
     title: 'Song credits',
-    description: 'Songwriters, composers and producers for a song.',
-    input: z.object({ id: z.union([z.string(), z.number()]) }),
+    description:
+      'Songwriters, composers and producers for a song. Long fields are capped at ' +
+      `maxChars characters (default ${TEXT_LIMITS.field}).`,
+    input: z.object({ id: z.union([z.string(), z.number()]), maxChars }),
     annotations: READ_ONLY,
     endpoint: 'song_creators',
+    render: (body, args) => {
+      const limit =
+        typeof args.maxChars === 'number' && args.maxChars > 0 ? Math.trunc(args.maxChars) : TEXT_LIMITS.field
+      return toToolText(capTextFields(trimGeneric(body), limit), TEXT_LIMITS.result)
+    },
   },
   {
     name: 'ncm_check_music',
@@ -904,14 +1143,21 @@ const musicTools: ToolDef[] = [
     name: 'ncm_album',
     toolset: 'music',
     title: 'Album detail',
-    description: 'Album metadata and its full track list.',
-    input: z.object({ id: z.union([z.string(), z.number()]) }),
+    description:
+      'Album metadata and its track list. The `songs` array is paginated: page (1-based, default 1) ' +
+      `and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}); album metadata is always returned.`,
+    input: z.object({ id: z.union([z.string(), z.number()]), ...paging }),
     annotations: READ_ONLY,
     endpoint: 'album',
+    paging: {
+      mode: 'local',
+      groups: [{ path: 'songs', label: 'songs', totalPath: 'album.size' }],
+    },
     render: (body) => {
       const album = body?.album ?? {}
       const songs = (body?.songs ?? []).map(slimSong)
-      const head = `${album.name} — ${(album.artist?.name ?? '')}${album.publishTime ? ` (${new Date(album.publishTime).toISOString().slice(0, 10)})` : ''}\nid=${album.id} tracks=${songs.length}`
+      const head = `${album.name} — ${(album.artist?.name ?? '')}${album.publishTime ? ` (${new Date(album.publishTime).toISOString().slice(0, 10)})` : ''}\nid=${album.id} tracks=${album.size ?? songs.length}`
+      if (!songs.length) return `${head}\n${emptyPageNote(body, 'songs', 'songs')}`
       return `${head}\n\n${songs.map(songLine).join('\n')}`
     },
   },
@@ -919,28 +1165,42 @@ const musicTools: ToolDef[] = [
     name: 'ncm_new_albums',
     toolset: 'music',
     title: 'New albums',
-    description: 'Newly released albums by region.',
+    description:
+      'Newly released albums by region. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
     input: z.object({
       area: z.enum(['ALL', 'ZH', 'EA', 'KR', 'JP']).optional(),
       ...paging,
     }),
     annotations: READ_ONLY,
     endpoint: 'album_new',
+    paging: { mode: 'offset', groups: [{ path: 'albums', label: 'albums' }] },
   },
   {
     name: 'ncm_artist',
     toolset: 'music',
     title: 'Artist detail',
-    description: 'Artist bio, aliases, follower counts and hot songs.',
-    input: z.object({ id: z.union([z.string(), z.number()]) }),
+    description:
+      'Artist bio, aliases, follower counts and hot songs. The bio is capped at ' +
+      `maxChars characters (default ${TEXT_LIMITS.description}) and marked when truncated.`,
+    input: z.object({ id: z.union([z.string(), z.number()]), maxChars }),
     annotations: READ_ONLY,
     endpoint: 'artist_detail',
+    render: (body, args) => {
+      const limit =
+        typeof args.maxChars === 'number' && args.maxChars > 0
+          ? Math.trunc(args.maxChars)
+          : TEXT_LIMITS.description
+      return toToolText(capTextFields(trimGeneric(body), limit), TEXT_LIMITS.result)
+    },
   },
   {
     name: 'ncm_artist_songs',
     toolset: 'music',
     title: 'Artist songs',
-    description: 'Songs by an artist, ordered by popularity or release time.',
+    description:
+      'Songs by an artist, ordered by popularity or release time. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
     input: z.object({
       id: z.union([z.string(), z.number()]),
       order: z.enum(['hot', 'time']).optional(),
@@ -948,16 +1208,20 @@ const musicTools: ToolDef[] = [
     }),
     annotations: READ_ONLY,
     endpoint: 'artist_songs',
+    paging: { mode: 'offset', groups: [{ path: 'songs', label: 'songs' }] },
     render: (body) => renderSongList((body?.songs ?? []).map(slimSong), 'Artist songs'),
   },
   {
     name: 'ncm_artist_albums',
     toolset: 'music',
     title: 'Artist albums',
-    description: 'Albums released by an artist.',
+    description:
+      'Albums released by an artist. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
     input: z.object({ id: z.union([z.string(), z.number()]), ...paging }),
     annotations: READ_ONLY,
     endpoint: 'artist_album',
+    paging: { mode: 'offset', groups: [{ path: 'hotAlbums', label: 'albums' }] },
     render: (body) =>
       (body?.hotAlbums ?? [])
         .map((a: any) => `- ${a.name} (${a.size ?? '?'} tracks) id=${a.id}`)
@@ -967,29 +1231,42 @@ const musicTools: ToolDef[] = [
     name: 'ncm_artist_top_songs',
     toolset: 'music',
     title: 'Artist top songs',
-    description: 'The most popular songs of an artist.',
-    input: z.object({ id: z.union([z.string(), z.number()]) }),
+    description:
+      'The most popular songs of an artist (the upstream returns at most 50). ' +
+      `Paged locally: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
+    input: z.object({ id: z.union([z.string(), z.number()]), ...paging }),
     annotations: READ_ONLY,
     endpoint: 'artist_top_song',
+    paging: { mode: 'local', groups: [{ path: 'songs', label: 'songs' }] },
     render: (body) => renderSongList((body?.songs ?? []).map(slimSong), 'Top songs'),
   },
   {
     name: 'ncm_similar_artists',
     toolset: 'music',
     title: 'Similar artists',
-    description: 'Artists similar to the given one.',
-    input: z.object({ id: z.union([z.string(), z.number()]) }),
+    description:
+      'Artists similar to the given one. ' +
+      `Paged locally: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
+    input: z.object({ id: z.union([z.string(), z.number()]), ...paging }),
     annotations: READ_ONLY,
     endpoint: 'simi_artist',
+    paging: { mode: 'local', groups: [{ path: 'artists', label: 'artists' }] },
   },
   {
     name: 'ncm_playlist',
     toolset: 'music',
     title: 'Playlist detail',
-    description: 'Playlist metadata plus its first tracks. Use ncm_playlist_tracks for full paging.',
-    input: z.object({ id: z.union([z.string(), z.number()]) }),
+    description:
+      'Playlist metadata plus its tracks. The `tracks` array is paginated: page (1-based, default 1) ' +
+      `and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}); playlist metadata (name, ` +
+      'counts, creator, description) is always returned. Use ncm_playlist_tracks for large playlists.',
+    input: z.object({ id: z.union([z.string(), z.number()]), ...paging }),
     annotations: READ_ONLY,
     endpoint: 'playlist_detail',
+    paging: {
+      mode: 'local',
+      groups: [{ path: 'playlist.tracks', label: 'tracks', totalPath: 'playlist.trackCount' }],
+    },
     render: (body) => {
       const playlist = body?.playlist ?? {}
       const slimmer = slimPlaylist(playlist)
@@ -998,7 +1275,7 @@ const musicTools: ToolDef[] = [
         `${slimmer.name} — ${slimmer.trackCount ?? tracks.length} tracks${slimmer.playCount ? `, ${slimmer.playCount} plays` : ''}`,
         `id=${slimmer.id}${slimmer.creator ? ` by ${slimmer.creator.name}` : ''}`,
         slimmer.description ? `\n${slimmer.description}` : '',
-        `\n${tracks.map(songLine).join('\n')}`,
+        `\n${tracks.length ? tracks.map(songLine).join('\n') : emptyPageNote(body, 'playlist.tracks', 'tracks')}`,
       ]
         .filter(Boolean)
         .join('\n')
@@ -1008,13 +1285,17 @@ const musicTools: ToolDef[] = [
     name: 'ncm_playlist_tracks',
     toolset: 'music',
     title: 'Playlist tracks',
-    description: 'Page through a playlist track list without loading the whole playlist.',
+    description:
+      'Page through a playlist track list without loading the whole playlist. ' +
+      `page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}) ` +
+      'are applied upstream; the footer says whether more tracks exist.',
     input: z.object({
       id: z.union([z.string(), z.number()]),
       ...paging,
     }),
     annotations: READ_ONLY,
     endpoint: 'playlist_track_all',
+    paging: { mode: 'offset', groups: [{ path: 'songs', label: 'tracks' }] },
     render: (body) => {
       const songs = (body?.songs ?? []).map(slimSong)
       return renderSongList(songs, `Tracks (${songs.length} in this page)`)
@@ -1024,10 +1305,13 @@ const musicTools: ToolDef[] = [
     name: 'ncm_related_playlists',
     toolset: 'music',
     title: 'Related playlists',
-    description: 'Playlists that contain the same track.',
-    input: z.object({ id: z.union([z.string(), z.number()]) }),
+    description:
+      'Playlists that contain the same track. ' +
+      `Paged locally: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
+    input: z.object({ id: z.union([z.string(), z.number()]), ...paging }),
     annotations: READ_ONLY,
     endpoint: 'related_playlist',
+    paging: { mode: 'local', groups: [{ path: 'playlists', label: 'playlists' }] },
     render: (body) =>
       (body?.playlists ?? []).map((p: any) => `- ${p.name} id=${p.id}`).join('\n') || '(none)',
   },
@@ -1091,14 +1375,23 @@ const libraryTools: ToolDef[] = [
     name: 'ncm_liked_songs',
     toolset: 'library',
     title: 'Liked song ids',
-    description: 'Every song id in the account "I like" playlist.',
-    input: z.object({ uid: z.union([z.string(), z.number()]).optional().describe('Defaults to yourself') }),
+    description:
+      'Every song id in the account "I like" playlist. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${MAX_PAGE_SIZE}, max ${MAX_PAGE_SIZE}); ` +
+      'the footer reports the full like total, so a large library never lands in one result.',
+    input: z.object({
+      uid: z.union([z.string(), z.number()]).optional().describe('Defaults to yourself'),
+      ...paging,
+    }),
     annotations: READ_ONLY,
     endpoint: 'likelist',
     requiresLogin: true,
-    render: (body) => {
-      const ids: Array<number | string> = body?.ids ?? []
-      return `${ids.length} liked songs\nids: ${ids.join(',')}`
+    render: (body, args) => {
+      const all: Array<number | string> = body?.ids ?? []
+      const { items, meta } = paginate(all, args, { defaultPageSize: MAX_PAGE_SIZE })
+      const group: PagedGroup = { label: 'song ids', path: 'ids', unit: 'ids', meta }
+      const text = items.length ? `ids: ${items.join(',')}` : pagingEmptyNote(meta, 'ids')
+      return `${all.length} liked songs\n${text}${pagingFooter([group])}`
     },
   },
   {
@@ -1123,18 +1416,25 @@ const libraryTools: ToolDef[] = [
     name: 'ncm_recent_songs',
     toolset: 'library',
     title: 'Recently played',
-    description: 'Recently played songs for the signed-in account.',
-    input: z.object({ limit: z.number().int().min(1).max(100).optional() }),
+    description:
+      'Recently played songs for the signed-in account. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}) ` +
+      'slice the history locally; the upstream returns at most 100 entries.',
+    input: z.object({ ...paging }),
     annotations: READ_ONLY,
     endpoint: 'record_recent_song',
     requiresLogin: true,
+    paging: { mode: 'local', groups: [{ path: 'data.list', label: 'songs' }] },
     render: (body) => renderSongList((body?.data?.list ?? []).map(slimSong), 'Recently played'),
   },
   {
     name: 'ncm_my_playlists',
     toolset: 'library',
     title: 'My playlists',
-    description: 'Playlists owned or collected by the signed-in account.',
+    description:
+      'Playlists owned or collected by the signed-in account. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}) ` +
+      'are applied upstream; the footer reports hasMore.',
     input: z.object({ ...paging }),
     annotations: READ_ONLY,
     endpoint: 'user_playlist',
@@ -1148,27 +1448,24 @@ const libraryTools: ToolDef[] = [
       }
       const result = await callNcm(
         'user_playlist',
-        { uid, ...(args.limit ? { limit: args.limit } : {}), ...(args.offset ? { offset: args.offset } : {}) },
+        { uid, ...upstreamWindow(pageRequest(args)) },
         { jar: runtime.jar, fakeIp: runtime.fakeIp },
       )
       if (!result.ok) {
         return { isError: true, content: [{ type: 'text', text: `Failed: ${result.body?.message ?? result.status}` }] }
       }
       const lists = result.body?.playlist ?? []
-      return {
-        content: [
-          {
-            type: 'text',
-            text:
-              lists
-                .map(
-                  (p: any) =>
-                    `- ${p.name} (${p.trackCount ?? '?'} tracks${p.subscribed ? ', collected' : ''}) id=${p.id}`,
-                )
-                .join('\n') || '(no playlists)',
-          },
-        ],
-      }
+      const more = typeof result.body?.more === 'boolean' ? result.body.more : undefined
+      const meta = pageMeta(pageRequest(args), lists.length, { hasMore: more })
+      const group: PagedGroup = { label: 'playlists', path: 'playlist', unit: 'playlists', meta }
+      const text =
+        lists
+          .map(
+            (p: any) =>
+              `- ${p.name} (${p.trackCount ?? '?'} tracks${p.subscribed ? ', collected' : ''}) id=${p.id}`,
+          )
+          .join('\n') || pagingEmptyNote(meta, 'playlists')
+      return { content: [{ type: 'text', text: `${text}${pagingFooter([group])}` }] }
     },
     requiresLogin: true,
   },
@@ -1284,20 +1581,27 @@ const libraryTools: ToolDef[] = [
     name: 'ncm_cloud_songs',
     toolset: 'library',
     title: 'Cloud music library',
-    description: 'Songs uploaded to the personal cloud music library.',
+    description:
+      'Songs uploaded to the personal cloud music library. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}); ` +
+      'the footer reports the cloud-drive total and hasMore.',
     input: z.object({ ...paging }),
     annotations: READ_ONLY,
     endpoint: 'user_cloud',
+    paging: { mode: 'offset', groups: [{ path: 'data', label: 'songs', totalPath: 'count' }] },
     requiresLogin: true,
   },
   {
     name: 'ncm_download_list',
     toolset: 'library',
     title: 'Download list',
-    description: 'Songs in the account download list.',
+    description:
+      'Songs in the account download list. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
     input: z.object({ ...paging }),
     annotations: READ_ONLY,
     endpoint: 'song_downlist',
+    paging: { mode: 'offset', groups: [{ path: 'data.list', label: 'songs', totalPath: 'data.totalCount' }] },
     requiresLogin: true,
   },
   {
@@ -1341,7 +1645,11 @@ const commentTools: ToolDef[] = [
     name: 'ncm_comments',
     toolset: 'comments',
     title: 'Read comments',
-    description: 'Comments of a song, album, playlist, MV, radio programme or video.',
+    description:
+      'Comments of a song, album, playlist, MV, radio programme or video. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}); ` +
+      'the footer reports the upstream total and hasMore. Comment bodies are capped at ' +
+      `${TEXT_LIMITS.description} characters.`,
     input: z.object({
       type: commentType,
       id: z.union([z.string(), z.number()]),
@@ -1363,15 +1671,18 @@ const commentTools: ToolDef[] = [
 
       const result = await callNcm(
         endpoint,
-        { id: args.id, ...(args.before ? { before: args.before } : {}), ...(args.limit ? { limit: args.limit } : {}) },
+        { id: args.id, ...(args.before ? { before: args.before } : {}), ...upstreamWindow(pageRequest(args)) },
         { jar: runtime.jar, fakeIp: runtime.fakeIp },
       )
       if (!result.ok) {
         return { isError: true, content: [{ type: 'text', text: `Failed: ${result.body?.message ?? result.status}` }] }
       }
       const comments = (result.body?.comments ?? []).map(slimComment)
-      const total = result.body?.total
-      const header = `${total ?? comments.length} comments${result.body?.more ? ' (more available)' : ''}`
+      const total = typeof result.body?.total === 'number' ? result.body.total : undefined
+      const more = typeof result.body?.more === 'boolean' ? result.body.more : undefined
+      const meta = pageMeta(pageRequest(args), comments.length, { total, hasMore: more })
+      const group: PagedGroup = { label: 'comments', path: 'comments', unit: 'comments', meta }
+      const header = `${total ?? 'unknown'} comments in total`
       const body = comments
         .map(
           (c: any) =>
@@ -1380,17 +1691,21 @@ const commentTools: ToolDef[] = [
             }`,
         )
         .join('\n')
-      return { content: [{ type: 'text', text: `${header}\n${body}` }] }
+      const text = body || pagingEmptyNote(meta, 'comments')
+      return { content: [{ type: 'text', text: `${header}\n${text}${pagingFooter([group])}` }] }
     },
   },
   {
     name: 'ncm_comment_hot',
     toolset: 'comments',
     title: 'Hot comments',
-    description: 'Top-liked comments for a song.',
-    input: z.object({ id: z.union([z.string(), z.number()]) }),
+    description:
+      'Top-liked comments for a song. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
+    input: z.object({ id: z.union([z.string(), z.number()]), ...paging }),
     annotations: READ_ONLY,
     endpoint: 'comment_hot',
+    paging: { mode: 'offset', groups: [{ path: 'hotComments', label: 'comments' }] },
     render: (body) => {
       const comments = (body?.hotComments ?? []).map(slimComment)
       return (
@@ -1533,10 +1848,17 @@ const socialTools: ToolDef[] = [
     name: 'ncm_subscribed_artists',
     toolset: 'social',
     title: 'Subscribed artists',
-    description: 'Artists the account has subscribed to.',
+    description:
+      'Artists the account has subscribed to. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}); ` +
+      'the footer reports the subscription total and hasMore.',
     input: z.object({ ...paging }),
     annotations: READ_ONLY,
     endpoint: 'artist_sublist',
+    paging: {
+      mode: 'offset',
+      groups: [{ path: 'data', label: 'artists', totalPath: 'total' }],
+    },
     requiresLogin: true,
   },
   {
@@ -1575,33 +1897,63 @@ const socialTools: ToolDef[] = [
     name: 'ncm_private_messages',
     toolset: 'social',
     title: 'Private messages',
-    description: 'Recent private message conversations.',
+    description:
+      'Recent private message conversations. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
     input: z.object({ ...paging }),
     annotations: READ_ONLY,
     endpoint: 'msg_private',
+    paging: { mode: 'offset', groups: [{ path: 'msgs', label: 'conversations' }] },
     requiresLogin: true,
   },
   {
     name: 'ncm_user_events',
     toolset: 'social',
     title: 'User activity feed',
-    description: 'Recent activity (shares, posts, follows) of a user.',
+    description:
+      'Recent activity (shares, posts, follows) of a user. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}). ` +
+      'For deeper history pass the `lasttime` cursor from the last event instead of a high page.',
     input: z.object({
       uid: z.union([z.string(), z.number()]),
-      limit: z.number().int().min(1).max(100).optional(),
-      lasttime: z.union([z.string(), z.number()]).optional(),
+      lasttime: z.union([z.string(), z.number()]).optional().describe('Cursor: timestamp of the oldest event seen'),
+      ...paging,
     }),
     annotations: READ_ONLY,
     endpoint: 'user_event',
+    mapArgs: (args) => ({
+      uid: args.uid,
+      ...(args.lasttime !== undefined ? { lasttime: args.lasttime } : {}),
+    }),
+    paging: { mode: 'limit', groups: [{ path: 'events', label: 'events' }] },
+    render: (body) => {
+      const events: any[] = body?.events ?? []
+      const lines = events.map((event) => {
+        const info = event?.info ?? {}
+        const title =
+          info.commentThread?.resourceInfo?.name ??
+          info?.name ??
+          event?.json?.msg ??
+          event?.info?.commentThread?.title ??
+          '(no title)'
+        const who = event?.user?.nickname ?? event?.info?.user?.nickname ?? 'someone'
+        const kind = info.commentThread ? 'comment' : info.resourceInfo ? 'share' : 'activity'
+        return `- [${kind}] ${who}: ${trimText(String(title), 120)} id=${event?.id ?? event?.discussId ?? '?'}`
+      })
+      return lines.join('\n') || emptyPageNote(body, 'events', 'events')
+    },
   },
   {
     name: 'ncm_similar_users',
     toolset: 'social',
     title: 'Similar users',
-    description: 'Users with similar taste.',
+    description:
+      'Users with similar taste. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
     input: z.object({ id: z.union([z.string(), z.number()]), ...paging }),
     annotations: READ_ONLY,
     endpoint: 'simi_user',
+    paging: { mode: 'offset', groups: [{ path: 'followeds', label: 'users' }] },
     render: (body) => renderUserList(body?.followeds ?? [], 'Similar users'),
   },
   {
@@ -1625,10 +1977,14 @@ const socialTools: ToolDef[] = [
     name: 'ncm_radio_detail',
     toolset: 'social',
     title: 'Radio station detail',
-    description: 'Programme list and metadata for a radio station.',
-    input: z.object({ rid: z.union([z.string(), z.number()]) }),
+    description:
+      'Programme list and metadata for a radio station. The `programs` array is paginated: page ' +
+      `(1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}); ` +
+      'station metadata is always returned.',
+    input: z.object({ rid: z.union([z.string(), z.number()]), ...paging }),
     annotations: READ_ONLY,
     endpoint: 'dj_detail',
+    paging: { mode: 'local', groups: [{ path: 'programs', label: 'programmes' }] },
   },
 ]
 
@@ -1697,9 +2053,11 @@ const metaTools: ToolDef[] = [
     title: 'List all endpoints',
     description:
       'List every underlying NetEase API endpoint this server can proxy. Useful before calling ' +
-      'ncm_raw for something the curated tools do not cover.',
+      'ncm_raw for something the curated tools do not cover. ' +
+      `Paged: page (1-based, default 1) and pageSize (default ${MAX_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
     input: z.object({
       filter: z.string().optional().describe('Only return endpoint names containing this substring'),
+      ...paging,
     }),
     annotations: READ_ONLY,
     run: async (args) => {
@@ -1708,11 +2066,15 @@ const metaTools: ToolDef[] = [
       const filtered = args.filter
         ? all.filter((name) => name.toLowerCase().includes(String(args.filter).toLowerCase()))
         : all
+      const { items, meta } = paginate(filtered, args, { defaultPageSize: MAX_PAGE_SIZE })
+      const group: PagedGroup = { label: 'endpoints', path: 'endpoints', unit: 'endpoints', meta }
       return {
         content: [
           {
             type: 'text',
-            text: `${filtered.length} of ${all.length} endpoints:\n${filtered.join(', ')}`,
+            text:
+              `${filtered.length} of ${all.length} endpoints:\n${items.join(', ')}` +
+              `${pagingFooter([group])}`,
           },
         ],
       }
@@ -1724,10 +2086,16 @@ const metaTools: ToolDef[] = [
     title: 'Raw endpoint call',
     description:
       'Call any underlying NetEase endpoint by name with free-form parameters. Read-only endpoints ' +
-      'are always allowed; write endpoints additionally need the ncm:write scope.',
+      'are always allowed; write endpoints additionally need the ncm:write scope. The payload is ' +
+      `capped at ${TEXT_LIMITS.raw} characters and long text fields at maxChars (default ` +
+      `${TEXT_LIMITS.field}); the result says when anything was cut. For offset-capable endpoints ` +
+      'pass limit/offset in params yourself.',
     input: z.object({
       endpoint: z.string().min(1).describe('Endpoint name, from ncm_list_endpoints'),
       params: z.record(z.string(), z.any()).optional().describe('Parameters passed straight through'),
+      maxChars: maxChars.describe(
+        `Maximum characters kept from each long text field (default ${TEXT_LIMITS.field}).`,
+      ),
     }),
     annotations: { readOnlyHint: false, openWorldHint: true },
     run: async (args, runtime) => {
@@ -1753,11 +2121,13 @@ const metaTools: ToolDef[] = [
           ],
         }
       }
+      const limit =
+        typeof args.maxChars === 'number' && args.maxChars > 0 ? Math.trunc(args.maxChars) : TEXT_LIMITS.field
       const result = await callNcm(args.endpoint, args.params ?? {}, {
         jar: runtime.jar,
         fakeIp: runtime.fakeIp,
       })
-      const text = toToolText(trimGeneric(result.body), 16000)
+      const text = toToolText(capTextFields(trimGeneric(result.body), limit), TEXT_LIMITS.raw)
       return { content: [{ type: 'text', text }], isError: !result.ok }
     },
   },

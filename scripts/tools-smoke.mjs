@@ -18,70 +18,70 @@ const TOKEN = process.env.NCM_SMOKE_TOKEN
 
 /** Arguments each tool needs to make a meaningful upstream call. */
 const SAMPLE_ARGS = {
-  ncm_search: { keywords: '周杰伦', limit: 2 },
-  ncm_search_cloud: { keywords: 'Jay Chou', limit: 2 },
-  ncm_search_suggest: { keywords: '周杰' },
-  ncm_search_hot: {},
-  ncm_search_multimatch: { keywords: '晴天' },
+  ncm_search: { keywords: '周杰伦', type: 'song', page: 1, pageSize: 2 },
+  ncm_search_cloud: { keywords: 'Jay Chou', type: 'song', page: 1, pageSize: 2 },
+  ncm_search_suggest: { keywords: '周杰', page: 1, pageSize: 3 },
+  ncm_search_hot: { page: 1, pageSize: 3 },
+  ncm_search_multimatch: { keywords: '晴天', pageSize: 3 },
   ncm_search_default: {},
-  ncm_search_lyric: { keywords: '故事的小黄花', limit: 2 },
-  ncm_search_song_page: { keywords: '晴天', pageSize: 2 },
+  ncm_search_lyric: { keywords: '故事的小黄花', pageSize: 2 },
+  ncm_search_song_page: { keywords: '晴天', page: 1, pageSize: 2 },
   ncm_song_detail: { ids: '347230' },
-  ncm_song_url: { ids: '347230', level: 'standard' },
+  ncm_song_url: { ids: '347230', level: 'standard', pageSize: 1 },
   ncm_song_download_url: { id: 347230 },
-  ncm_lyric: { id: 347230 },
-  ncm_lyric_mark: { id: 347230 },
-  ncm_similar_songs: { id: 347230, limit: 2 },
+  ncm_lyric: { id: 347230, maxChars: 400 },
+  ncm_lyric_mark: { id: 347230, maxChars: 400 },
+  ncm_similar_songs: { id: 347230, pageSize: 2 },
   ncm_song_creators: { id: 347230 },
   ncm_check_music: { id: 347230 },
-  ncm_album: { id: 32311 },
-  ncm_new_albums: { limit: 2 },
+  ncm_album: { id: 32311, pageSize: 2 },
+  ncm_new_albums: { pageSize: 2 },
   ncm_artist: { id: 6452 },
-  ncm_artist_songs: { id: 6452, limit: 2 },
-  ncm_artist_albums: { id: 6452, limit: 2 },
-  ncm_artist_top_songs: { id: 6452 },
-  ncm_similar_artists: { id: 6452 },
-  ncm_playlist: { id: 24381616 },
-  ncm_playlist_tracks: { id: 24381616, limit: 2 },
-  ncm_related_playlists: { id: 24381616 },
+  ncm_artist_songs: { id: 6452, pageSize: 2 },
+  ncm_artist_albums: { id: 6452, pageSize: 2 },
+  ncm_artist_top_songs: { id: 6452, pageSize: 2 },
+  ncm_similar_artists: { id: 6452, pageSize: 2 },
+  ncm_playlist: { id: 24381616, pageSize: 2 },
+  ncm_playlist_tracks: { id: 24381616, page: 1, pageSize: 2 },
+  ncm_related_playlists: { id: 24381616, pageSize: 2 },
   ncm_mv_url: { id: 5436712 },
   ncm_mv_detail: { mvid: 5436712 },
   ncm_account_status: {},
   ncm_account_profile: {},
   ncm_user_detail: { uid: 32953014 },
-  ncm_user_follows: { uid: 32953014, limit: 2 },
-  ncm_user_followeds: { uid: 32953014, limit: 2 },
+  ncm_user_follows: { uid: 32953014, pageSize: 2 },
+  ncm_user_followeds: { uid: 32953014, pageSize: 2 },
   ncm_vip_info: {},
-  ncm_personalized: { limit: 2 },
-  ncm_recommend_songs: {},
-  ncm_recommend_resource: {},
-  ncm_new_songs: { limit: 2 },
-  ncm_toplist: {},
-  ncm_toplist_detail: {},
-  ncm_toplist_songs: { id: 19723756, limit: 2 },
-  ncm_banner: {},
-  ncm_top_songs: { area: 'all' },
-  ncm_top_playlists: { limit: 2 },
-  ncm_top_artists: { limit: 2 },
-  ncm_music_calendar: { startTime: Date.now() - 7 * 86400000, endTime: Date.now() },
-  ncm_comments: { type: 'song', id: 347230, limit: 2 },
-  ncm_comment_hot: { id: 347230 },
-  ncm_user_events: { uid: 32953014, limit: 2 },
-  ncm_similar_users: { id: 32953014, limit: 2 },
-  ncm_radio_detail: { rid: 336355127 },
-  ncm_subscribed_artists: { limit: 2 },
-  ncm_liked_songs: {},
-  ncm_recent_songs: { limit: 2 },
-  ncm_my_playlists: { limit: 2 },
-  ncm_cloud_songs: { limit: 2 },
-  ncm_download_list: { limit: 2 },
+  ncm_personalized: { pageSize: 2 },
+  ncm_recommend_songs: { pageSize: 2 },
+  ncm_recommend_resource: { pageSize: 2 },
+  ncm_new_songs: { pageSize: 2 },
+  ncm_toplist: { pageSize: 2 },
+  ncm_toplist_detail: { pageSize: 2 },
+  ncm_toplist_songs: { id: 19723756, pageSize: 2 },
+  ncm_banner: { pageSize: 2 },
+  ncm_top_songs: { area: 'all', pageSize: 2 },
+  ncm_top_playlists: { pageSize: 2 },
+  ncm_top_artists: { pageSize: 2 },
+  ncm_music_calendar: { startTime: Date.now() - 7 * 86400000, endTime: Date.now(), pageSize: 2 },
+  ncm_comments: { type: 'song', id: 347230, pageSize: 2 },
+  ncm_comment_hot: { id: 347230, pageSize: 2 },
+  ncm_user_events: { uid: 32953014, pageSize: 2 },
+  ncm_similar_users: { id: 32953014, pageSize: 2 },
+  ncm_radio_detail: { rid: 336355127, pageSize: 2 },
+  ncm_subscribed_artists: { pageSize: 2 },
+  ncm_liked_songs: { pageSize: 5 },
+  ncm_recent_songs: { pageSize: 2 },
+  ncm_my_playlists: { pageSize: 2 },
+  ncm_cloud_songs: { pageSize: 2 },
+  ncm_download_list: { pageSize: 2 },
   ncm_listen_stats: {},
   ncm_user_binding: {},
   ncm_yunbei: {},
   ncm_user_level: {},
   ncm_user_counts: {},
-  ncm_list_endpoints: { filter: 'song' },
-  ncm_raw: { endpoint: 'song_detail', params: { ids: '347230' } },
+  ncm_list_endpoints: { filter: 'song', pageSize: 5 },
+  ncm_raw: { endpoint: 'song_detail', params: { ids: '347230' }, maxChars: 400 },
   ncm_about: {},
 }
 
@@ -158,7 +158,31 @@ async function main() {
     const isError = payload?.isError === true || result.status !== 200
 
     if (!isError && text.trim().length > 0) {
-      rows.push({ tool: tool.name, verdict: 'ok', detail: `${elapsed}ms`, text: text.slice(0, 90) })
+      // Paged tools must tell the model where it is, and no single result may be huge.
+      // Small non-list payloads (e.g. a single suggested query) legitimately carry no
+      // paging metadata, so only enforce it once the response is substantial.
+      const paged = 'pageSize' in sample || 'page' in sample
+      const showsPaging = /page \d+ · |"paging"|paging:/i.test(text)
+      if (paged && !showsPaging && text.length > 300) {
+        failures += 1
+        rows.push({
+          tool: tool.name,
+          verdict: 'FAIL',
+          detail: `${elapsed}ms`,
+          text: `paged tool returned ${text.length} chars with no paging metadata`,
+        })
+        continue
+      }
+      if (text.length > 20000) {
+        rows.push({
+          tool: tool.name,
+          verdict: 'oversized',
+          detail: `${elapsed}ms`,
+          text: `${text.length} chars`,
+        })
+        continue
+      }
+      rows.push({ tool: tool.name, verdict: 'ok', detail: `${elapsed}ms (${text.length} chars)`, text: text.slice(0, 90) })
       continue
     }
 
@@ -173,18 +197,23 @@ async function main() {
   }
 
   for (const row of rows) {
-    const mark = row.verdict === 'FAIL' ? 'FAIL' : row.verdict === 'ok' ? ' ok ' : ' -- '
+    const mark =
+      row.verdict === 'FAIL' ? 'FAIL' : row.verdict === 'ok' ? ' ok ' : row.verdict === 'oversized' ? 'BIG ' : ' -- '
     console.log(`${mark} ${row.tool.padEnd(26)} ${row.verdict.padEnd(15)} ${row.detail}`)
-    if (row.verdict === 'FAIL' && row.text) console.log(`     ${row.text.replace(/\n/g, ' ')}`)
+    if ((row.verdict === 'FAIL' || row.verdict === 'oversized') && row.text) {
+      console.log(`     ${row.text.replace(/\n/g, ' ')}`)
+    }
   }
 
   const ok = rows.filter((row) => row.verdict === 'ok').length
   const loginRequired = rows.filter((row) => row.verdict === 'login-required').length
+  const oversized = rows.filter((row) => row.verdict === 'oversized').length
   const skipped = rows.filter((row) => row.verdict === 'no-sample').length
   console.log(
-    `\n${ok} ok, ${loginRequired} need a real login, ${failures} failed, ${skipped} without a sample call`,
+    `\n${ok} ok, ${loginRequired} need a real login, ${failures} failed, ` +
+      `${oversized} oversized (>20000 chars), ${skipped} without a sample call`,
   )
-  if (failures > 0) process.exitCode = 1
+  if (failures > 0 || oversized > 0) process.exitCode = 1
 }
 
 main().catch((error) => {
