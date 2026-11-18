@@ -1,6 +1,7 @@
 import { cookies } from 'next/headers'
 
 import { parseCookieString, hasSession } from '@/lib/ncm/cookies'
+import { messagesFromRequest } from '@/lib/i18n'
 import { jsonResponse } from '@/lib/oauth/server'
 import { AUTHZ_COOKIE, finishAuthorization, readAuthzCookie } from '@/lib/oauth/authorize-flow'
 import { crossOriginRejection, isSameOrigin } from '@/lib/oauth/same-origin'
@@ -21,25 +22,23 @@ interface Body {
  * client's `redirect_uri` is never taken from user-controlled input here.
  */
 export async function POST(request: Request): Promise<Response> {
-  if (!isSameOrigin(request)) return crossOriginRejection()
+  const text = messagesFromRequest(request).api
+  if (!isSameOrigin(request)) return crossOriginRejection(text.crossOrigin)
   const authz = await readAuthzCookie()
   if (!authz) {
-    return jsonResponse(
-      { ok: false, message: 'Login session expired. Close this tab and retry from your MCP client.' },
-      400,
-    )
+    return jsonResponse({ ok: false, message: text.sessionExpired }, 400)
   }
 
   let body: Body
   try {
     body = (await request.json()) as Body
   } catch {
-    return jsonResponse({ ok: false, message: 'Body must be JSON' }, 400)
+    return jsonResponse({ ok: false, message: text.bodyMustBeJson }, 400)
   }
 
   const jar = parseCookieString(body.jar)
   if (!hasSession(jar)) {
-    return jsonResponse({ ok: false, message: 'No NetEase session cookie was provided' }, 400)
+    return jsonResponse({ ok: false, message: text.noSessionCookie }, 400)
   }
 
   const { redirectUrl } = await finishAuthorization(authz, {

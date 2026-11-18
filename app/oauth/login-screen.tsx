@@ -11,8 +11,12 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Separator } from '@/components/ui/separator'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { format, type Messages } from '@/lib/i18n/messages'
 
 type Phase = 'idle' | 'busy' | 'done'
+
+/** Every visible string on this screen; resolved on the server from the request locale. */
+export type LoginMessages = Messages['login']
 
 /** Shared sizing so inputs and inline buttons line up on every breakpoint. */
 const FIELD = 'h-10 border-border/80 bg-muted/40'
@@ -24,12 +28,13 @@ interface QrState {
 }
 
 export interface LoginScreenProps {
+  messages: LoginMessages
   clientName: string
   scope: string
   error?: { code: string; message: string }
 }
 
-async function postJson<T>(url: string, body: unknown): Promise<T> {
+async function postJson<T>(url: string, body: unknown, messages: LoginMessages): Promise<T> {
   const response = await fetch(url, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -49,50 +54,67 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
     const detail = text.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200)
     throw new Error(
       response.ok
-        ? 'The server returned a response that is not valid JSON. Try again.'
-        : `The server failed with HTTP ${response.status}${detail ? `: ${detail}` : '.'}`,
+        ? messages.client.invalidJson
+        : format(messages.client.httpFailed, {
+            status: response.status,
+            detail: detail ? `: ${detail}` : '.',
+          }),
     )
   }
 
   if (!response.ok) {
     const message = (parsed as { message?: string })?.message
-    throw new Error(message ?? `The server rejected the request (HTTP ${response.status}).`)
+    throw new Error(message ?? format(messages.client.rejected, { status: response.status }))
   }
   return parsed
 }
 
 /** Hands the session jar to the server and follows the resulting client redirect. */
-async function finishLogin(payload: Record<string, unknown>): Promise<void> {
+async function finishLogin(
+  payload: Record<string, unknown>,
+  messages: LoginMessages,
+): Promise<void> {
   const data = await postJson<{ ok: boolean; redirect?: string; message?: string }>(
     '/api/auth/complete',
     payload,
+    messages,
   )
   if (!data.ok || !data.redirect) {
-    throw new Error(data.message ?? 'Sign-in finished, but the redirect back to your client failed.')
+    throw new Error(data.message ?? messages.client.redirectFailed)
   }
   window.location.replace(data.redirect)
-}export function LoginScreen({ clientName, scope, error }: LoginScreenProps) {
-  if (error) return <ErrorScreen clientName={clientName} error={error} />
-  return <LoginForm clientName={clientName} scope={scope} />
 }
 
-function LoginForm({ clientName, scope }: { clientName: string; scope: string }) {
+export function LoginScreen({ messages, clientName, scope, error }: LoginScreenProps) {
+  if (error) return <ErrorScreen messages={messages} clientName={clientName} error={error} />
+  return <LoginForm messages={messages} clientName={clientName} scope={scope} />
+}
+
+function LoginForm({
+  messages,
+  clientName,
+  scope,
+}: {
+  messages: LoginMessages
+  clientName: string
+  scope: string
+}) {
   return (
-    <Shell clientName={clientName} scope={scope}>
+    <Shell messages={messages} clientName={clientName} scope={scope}>
       <Tabs defaultValue="qr" className="gap-5">
         <TabsList className="w-full">
-          <TabsTrigger value="qr">QR code</TabsTrigger>
-          <TabsTrigger value="sms">SMS code</TabsTrigger>
-          <TabsTrigger value="password">Password</TabsTrigger>
+          <TabsTrigger value="qr">{messages.tabs.qr}</TabsTrigger>
+          <TabsTrigger value="sms">{messages.tabs.sms}</TabsTrigger>
+          <TabsTrigger value="password">{messages.tabs.password}</TabsTrigger>
         </TabsList>
         <TabsContent value="qr" keepMounted>
-          <QrPanel />
+          <QrPanel messages={messages} />
         </TabsContent>
         <TabsContent value="sms" keepMounted>
-          <SmsPanel />
+          <SmsPanel messages={messages} />
         </TabsContent>
         <TabsContent value="password" keepMounted>
-          <PasswordPanel />
+          <PasswordPanel messages={messages} />
         </TabsContent>
       </Tabs>
     </Shell>
@@ -100,10 +122,12 @@ function LoginForm({ clientName, scope }: { clientName: string; scope: string })
 }
 
 function Shell({
+  messages,
   clientName,
   scope,
   children,
 }: {
+  messages: LoginMessages
   clientName: string
   scope: string
   children: React.ReactNode
@@ -116,14 +140,14 @@ function Shell({
           <div className="mx-auto mb-1 flex size-11 items-center justify-center rounded-xl bg-primary text-primary-foreground">
             <Music4 className="size-5" aria-hidden="true" />
           </div>
-          <CardTitle className="text-lg">Sign in to NetEase Cloud Music</CardTitle>
+          <CardTitle className="text-lg">{messages.heading}</CardTitle>
           <CardDescription>
-            <span className="font-medium text-foreground">{clientName}</span> wants to use your
-            NetEase account through this MCP server.
+            <span className="font-medium text-foreground">{clientName}</span>{' '}
+            {messages.subtitleBefore}
           </CardDescription>
           {scopes.length > 0 ? (
             <div className="flex flex-wrap items-center justify-center gap-1.5 pt-1">
-              <span className="text-xs text-muted-foreground">Scopes:</span>
+              <span className="text-xs text-muted-foreground">{messages.scopes}:</span>
               {scopes.map((entry) => (
                 <Badge key={entry} variant="secondary" className="font-mono text-[11px]">
                   {entry}
@@ -135,10 +159,7 @@ function Shell({
         <CardContent className="pt-0">{children}</CardContent>
         <div className="px-6 pb-6">
           <Separator className="mb-3" />
-          <p className="text-[11px] leading-relaxed text-muted-foreground">
-            Your NetEase session is sealed inside the MCP access token and never stored on the
-            server. Disconnecting the client revokes access.
-          </p>
+          <p className="text-[11px] leading-relaxed text-muted-foreground">{messages.footer}</p>
         </div>
       </Card>
     </main>
@@ -146,9 +167,11 @@ function Shell({
 }
 
 function ErrorScreen({
+  messages,
   clientName,
   error,
 }: {
+  messages: LoginMessages
   clientName: string
   error: { code: string; message: string }
 }) {
@@ -159,10 +182,11 @@ function ErrorScreen({
           <div className="mb-1 flex size-11 items-center justify-center rounded-xl bg-destructive/10 text-destructive">
             <TriangleAlert className="size-5" aria-hidden="true" />
           </div>
-          <CardTitle className="text-lg">Can&apos;t continue sign-in</CardTitle>
+          <CardTitle className="text-lg">{messages.errorScreen.title}</CardTitle>
           <CardDescription>
-            The authorization request for <span className="font-medium text-foreground">{clientName}</span>{' '}
-            was rejected.
+            {messages.errorScreen.descriptionBefore}{' '}
+            <span className="font-medium text-foreground">{clientName}</span>{' '}
+            {messages.errorScreen.descriptionAfter}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -171,21 +195,18 @@ function ErrorScreen({
             <AlertTitle className="font-mono text-xs">{error.code}</AlertTitle>
             <AlertDescription>{error.message}</AlertDescription>
           </Alert>
-          <p className="text-xs text-muted-foreground">
-            Close this tab and start again from your MCP client. If it keeps failing, the client is
-            sending a request this server does not accept.
-          </p>
+          <p className="text-xs text-muted-foreground">{messages.errorScreen.hint}</p>
         </CardContent>
       </Card>
     </main>
   )
 }
 
-function QrPanel() {
+function QrPanel({ messages }: { messages: LoginMessages }) {
   const [qr, setQr] = useState<QrState | null>(null)
   const [status, setStatus] = useState<{ tone: 'muted' | 'warn' | 'ok' | 'error'; text: string }>({
     tone: 'muted',
-    text: 'Generating QR code…',
+    text: messages.qr.generating,
   })
   const [loading, setLoading] = useState(true)
   const [reloadKey, setReloadKey] = useState(0)
@@ -197,22 +218,23 @@ function QrPanel() {
     finished.current = false
     setLoading(true)
     setQr(null)
-    setStatus({ tone: 'muted', text: 'Generating QR code…' })
+    setStatus({ tone: 'muted', text: messages.qr.generating })
 
     postJson<{ ok: boolean; key?: string; qrImage?: string; message?: string }>(
       '/api/auth/qr/create',
       {},
+      messages,
     )
       .then((data) => {
         if (cancelled) return
         if (!data.ok || !data.key || !data.qrImage) {
           setLoading(false)
-          setStatus({ tone: 'error', text: data.message ?? 'Could not create a QR code.' })
+          setStatus({ tone: 'error', text: data.message ?? messages.qr.createFailed })
           return
         }
         setQr({ key: data.key, image: data.qrImage })
         setLoading(false)
-        setStatus({ tone: 'muted', text: 'Waiting for scan…' })
+        setStatus({ tone: 'muted', text: messages.qr.waiting })
 
         timer = setInterval(async () => {
           if (finished.current) return
@@ -224,42 +246,41 @@ function QrPanel() {
               userId?: number
               nickname?: string
               message?: string
-            }>('/api/auth/qr/poll', { key: data.key })
+            }>('/api/auth/qr/poll', { key: data.key }, messages)
             if (cancelled || finished.current) return
 
             if (poll.status === 801) {
-              setStatus({ tone: 'muted', text: 'Waiting for scan…' })
+              setStatus({ tone: 'muted', text: messages.qr.waiting })
               return
             }
             if (poll.status === 802) {
-              setStatus({ tone: 'warn', text: 'Scanned — confirm on your phone' })
+              setStatus({ tone: 'warn', text: messages.qr.scanned })
               return
             }
             if (poll.status === 800) {
               clearInterval(timer)
-              setStatus({ tone: 'error', text: 'This QR code expired. Request a new one.' })
+              setStatus({ tone: 'error', text: messages.qr.expired })
               return
             }
             if (poll.ok && poll.jar) {
               finished.current = true
               clearInterval(timer)
-              setStatus({ tone: 'ok', text: 'Signed in — finishing…' })
-              await finishLogin({
-                jar: poll.jar,
-                userId: poll.userId,
-                nickname: poll.nickname,
-              })
+              setStatus({ tone: 'ok', text: messages.qr.signedIn })
+              await finishLogin(
+                { jar: poll.jar, userId: poll.userId, nickname: poll.nickname },
+                messages,
+              )
               return
             }
             if (poll.status === 400) {
               clearInterval(timer)
-              setStatus({ tone: 'error', text: poll.message ?? 'QR sign-in was blocked.' })
+              setStatus({ tone: 'error', text: poll.message ?? messages.qr.blocked })
               return
             }
             clearInterval(timer)
-            setStatus({ tone: 'error', text: poll.message ?? 'QR sign-in failed.' })
+            setStatus({ tone: 'error', text: poll.message ?? messages.qr.failed })
           } catch {
-            setStatus({ tone: 'warn', text: 'Connection hiccup, retrying…' })
+            setStatus({ tone: 'warn', text: messages.qr.retrying })
           }
         }, 2000)
       })
@@ -273,7 +294,7 @@ function QrPanel() {
       cancelled = true
       if (timer) clearInterval(timer)
     }
-  }, [reloadKey])
+  }, [reloadKey, messages])
 
   const toneClass = {
     muted: 'text-muted-foreground',
@@ -290,7 +311,7 @@ function QrPanel() {
             // eslint-disable-next-line @next/next/no-img-element
             <img
               src={qr.image}
-              alt="NetEase sign-in QR code"
+              alt={messages.qr.imageAlt}
               className="size-full"
               style={{ imageRendering: 'pixelated' }}
             />
@@ -299,12 +320,12 @@ function QrPanel() {
               {loading ? (
                 <>
                   <Loader2 className="size-5 animate-spin" />
-                  <span>Generating…</span>
+                  <span>{messages.qr.generatingShort}</span>
                 </>
               ) : (
                 <>
                   <AlertCircle className="size-5" />
-                  <span>QR unavailable</span>
+                  <span>{messages.qr.unavailable}</span>
                 </>
               )}
             </div>
@@ -312,13 +333,13 @@ function QrPanel() {
         </div>
 
         <div className="space-y-2.5">
-          <p className="text-sm font-medium">Scan with the NetEase Cloud Music app</p>
+          <p className="text-sm font-medium">{messages.qr.title}</p>
           <ol className="space-y-1 text-xs text-muted-foreground">
-            <li>1. Open the NetEase Cloud Music mobile app</li>
-            <li>
-              2. Tap <span className="font-medium text-foreground">Scan</span> in the search bar
-            </li>
-            <li>3. Confirm the sign-in on your phone</li>
+            {messages.qr.steps.map((step, index) => (
+              <li key={step}>
+                {index + 1}. {step}
+              </li>
+            ))}
           </ol>
 
           <p
@@ -341,7 +362,7 @@ function QrPanel() {
           onClick={() => setReloadKey((value) => value + 1)}
         >
           <RefreshCw className="size-3.5" />
-          Get a new QR code
+          {messages.qr.refresh}
         </Button>
         {status.tone === 'error' ? (
           <Button
@@ -351,7 +372,7 @@ function QrPanel() {
             className="h-8 px-3 text-xs"
             onClick={() => setReloadKey((value) => value + 1)}
           >
-            Try again
+            {messages.qr.tryAgain}
           </Button>
         ) : null}
       </div>
@@ -359,7 +380,7 @@ function QrPanel() {
   )
 }
 
-function SmsPanel() {
+function SmsPanel({ messages }: { messages: LoginMessages }) {
   const [phone, setPhone] = useState('')
   const [country, setCountry] = useState('86')
   const [code, setCode] = useState('')
@@ -378,32 +399,36 @@ function SmsPanel() {
 
   const sendCode = useCallback(async () => {
     if (!phone.trim() || cooldown > 0) return
-    setStatus({ tone: 'muted', text: 'Sending…' })
+    setStatus({ tone: 'muted', text: messages.sms.sending })
     try {
-      const data = await postJson<{ ok: boolean; message?: string }>('/api/auth/sms/send', {
-        phone: phone.trim(),
-        countrycode: country.trim() || '86',
-      })
+      const data = await postJson<{ ok: boolean; message?: string }>(
+        '/api/auth/sms/send',
+        {
+          phone: phone.trim(),
+          countrycode: country.trim() || '86',
+        },
+        messages,
+      )
       if (!data.ok) {
-        setStatus({ tone: 'error', text: data.message ?? 'Could not send the code.' })
+        setStatus({ tone: 'error', text: data.message ?? messages.sms.sendFailed })
         return
       }
-      setStatus({ tone: 'ok', text: 'Verification code sent.' })
+      setStatus({ tone: 'ok', text: messages.sms.sent })
       setCooldown(60)
     } catch (cause) {
       setStatus({ tone: 'error', text: (cause as Error).message })
     }
-  }, [phone, country, cooldown])
+  }, [phone, country, cooldown, messages])
 
   const submit = useCallback(
     async (event: React.FormEvent) => {
       event.preventDefault()
       if (!phone.trim() || !code.trim()) {
-        setStatus({ tone: 'error', text: 'Enter your phone number and the code.' })
+        setStatus({ tone: 'error', text: messages.sms.missing })
         return
       }
       setPhase('busy')
-      setStatus({ tone: 'muted', text: 'Signing in…' })
+      setStatus({ tone: 'muted', text: messages.sms.signingIn })
       try {
         const data = await postJson<{
           ok: boolean
@@ -411,35 +436,39 @@ function SmsPanel() {
           userId?: number
           nickname?: string
           message?: string
-        }>('/api/auth/sms/login', {
-          phone: phone.trim(),
-          countrycode: country.trim() || '86',
-          captcha: code.trim(),
-        })
+        }>(
+          '/api/auth/sms/login',
+          {
+            phone: phone.trim(),
+            countrycode: country.trim() || '86',
+            captcha: code.trim(),
+          },
+          messages,
+        )
         if (!data.ok || !data.jar) {
           setPhase('idle')
-          setStatus({ tone: 'error', text: data.message ?? 'Sign-in failed.' })
+          setStatus({ tone: 'error', text: data.message ?? messages.sms.failed })
           return
         }
         setPhase('done')
-        setStatus({ tone: 'ok', text: 'Signed in — finishing…' })
-        await finishLogin({ jar: data.jar, userId: data.userId, nickname: data.nickname })
+        setStatus({ tone: 'ok', text: messages.qr.signedIn })
+        await finishLogin({ jar: data.jar, userId: data.userId, nickname: data.nickname }, messages)
       } catch (cause) {
         setPhase('idle')
         setStatus({ tone: 'error', text: (cause as Error).message })
       }
     },
-    [phone, country, code],
+    [phone, country, code, messages],
   )
 
   return (
     <form className="space-y-4" onSubmit={submit}>
       <div className="space-y-2">
-        <Label htmlFor="sms-phone">Phone number</Label>
+        <Label htmlFor="sms-phone">{messages.sms.phoneLabel}</Label>
         <div className="flex gap-2">
           <Input
             id="sms-country"
-            aria-label="Country code"
+            aria-label={messages.sms.countryLabel}
             className={`w-[4.5rem] shrink-0 text-center tabular-nums ${FIELD}`}
             inputMode="numeric"
             value={country}
@@ -450,7 +479,7 @@ function SmsPanel() {
             type="tel"
             inputMode="tel"
             autoComplete="tel"
-            placeholder="13800000000"
+            placeholder={messages.sms.phonePlaceholder}
             className={`min-w-0 flex-1 ${FIELD}`}
             value={phone}
             onChange={(event) => setPhone(event.target.value)}
@@ -459,13 +488,13 @@ function SmsPanel() {
       </div>
 
       <div className="space-y-2">
-        <Label htmlFor="sms-code">Verification code</Label>
+        <Label htmlFor="sms-code">{messages.sms.codeLabel}</Label>
         <div className="flex gap-2">
           <Input
             id="sms-code"
             inputMode="numeric"
             autoComplete="one-time-code"
-            placeholder="6 digits"
+            placeholder={messages.sms.codePlaceholder}
             className={`min-w-0 flex-1 ${FIELD}`}
             value={code}
             onChange={(event) => setCode(event.target.value)}
@@ -477,14 +506,14 @@ function SmsPanel() {
             disabled={cooldown > 0 || !phone.trim()}
             onClick={sendCode}
           >
-            {cooldown > 0 ? `${cooldown}s` : 'Send code'}
+            {cooldown > 0 ? `${cooldown}s` : messages.sms.send}
           </Button>
         </div>
       </div>
 
       <Button type="submit" className={`w-full ${FIELD_BUTTON}`} disabled={phase === 'busy'}>
         {phase === 'busy' ? <Loader2 className="size-4 animate-spin" /> : null}
-        Sign in
+        {messages.sms.submit}
       </Button>
 
       <StatusLine {...status} />
@@ -492,7 +521,7 @@ function SmsPanel() {
   )
 }
 
-function PasswordPanel() {
+function PasswordPanel({ messages }: { messages: LoginMessages }) {
   const [account, setAccount] = useState('')
   const [password, setPassword] = useState('')
   const [country, setCountry] = useState('86')
@@ -508,11 +537,11 @@ function PasswordPanel() {
     async (event: React.FormEvent) => {
       event.preventDefault()
       if (!account.trim() || !password) {
-        setStatus({ tone: 'error', text: 'Enter your account and password.' })
+        setStatus({ tone: 'error', text: messages.password.missing })
         return
       }
       setPhase('busy')
-      setStatus({ tone: 'muted', text: 'Signing in…' })
+      setStatus({ tone: 'muted', text: messages.password.signingIn })
       try {
         const data = await postJson<{
           ok: boolean
@@ -520,35 +549,39 @@ function PasswordPanel() {
           userId?: number
           nickname?: string
           message?: string
-        }>('/api/auth/password/login', {
-          account: account.trim(),
-          password,
-          countrycode: country.trim() || '86',
-        })
+        }>(
+          '/api/auth/password/login',
+          {
+            account: account.trim(),
+            password,
+            countrycode: country.trim() || '86',
+          },
+          messages,
+        )
         if (!data.ok || !data.jar) {
           setPhase('idle')
-          setStatus({ tone: 'error', text: data.message ?? 'Sign-in failed.' })
+          setStatus({ tone: 'error', text: data.message ?? messages.password.failed })
           return
         }
         setPhase('done')
-        setStatus({ tone: 'ok', text: 'Signed in — finishing…' })
-        await finishLogin({ jar: data.jar, userId: data.userId, nickname: data.nickname })
+        setStatus({ tone: 'ok', text: messages.qr.signedIn })
+        await finishLogin({ jar: data.jar, userId: data.userId, nickname: data.nickname }, messages)
       } catch (cause) {
         setPhase('idle')
         setStatus({ tone: 'error', text: (cause as Error).message })
       }
     },
-    [account, password, country],
+    [account, password, country, messages],
   )
 
   return (
     <form className="space-y-4" onSubmit={submit}>
       <div className="space-y-2">
-        <Label htmlFor="account">Phone number or email</Label>
+        <Label htmlFor="account">{messages.password.accountLabel}</Label>
         <Input
           id="account"
           autoComplete="username"
-          placeholder="13800000000 or you@example.com"
+          placeholder={messages.password.accountPlaceholder}
           className={FIELD}
           value={account}
           onChange={(event) => setAccount(event.target.value)}
@@ -557,7 +590,7 @@ function PasswordPanel() {
 
       {isEmail ? null : (
         <div className="space-y-2">
-          <Label htmlFor="country">Country code</Label>
+          <Label htmlFor="country">{messages.password.countryLabel}</Label>
           <Input
             id="country"
             inputMode="numeric"
@@ -569,7 +602,7 @@ function PasswordPanel() {
       )}
 
       <div className="space-y-2">
-        <Label htmlFor="password">Password</Label>
+        <Label htmlFor="password">{messages.password.passwordLabel}</Label>
         <Input
           id="password"
           type="password"
@@ -582,7 +615,7 @@ function PasswordPanel() {
 
       <Button type="submit" className={`w-full ${FIELD_BUTTON}`} disabled={phase === 'busy'}>
         {phase === 'busy' ? <Loader2 className="size-4 animate-spin" /> : null}
-        Sign in
+        {messages.password.submit}
       </Button>
 
       <StatusLine {...status} />

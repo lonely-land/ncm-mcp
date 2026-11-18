@@ -74,6 +74,10 @@ Set these in the Vercel project, then deploy:
 
 Point the client at `https://<your-deployment>/mcp`. Nothing else is needed: the server answers `401`, and the client discovers the rest.
 
+The landing page, the login page and the OAuth/login error messages follow the browser's `Accept-Language` (`en` and `zh-CN`). No language framework is involved: a typed dictionary in `lib/i18n/` is resolved per request, an `ncm_locale` cookie wins over the header when present, and unknown languages fall back to English.
+
+`GET /healthz` is an unauthenticated liveness probe for uptime monitors. It returns `{"status":"ok","uptime":…,"version":…}` and deliberately touches neither NetEase cookies nor the upstream API, so it stays green while NetEase is unreachable.
+
 **Claude Code / Cursor / VS Code** — add an HTTP MCP server:
 
 ```json

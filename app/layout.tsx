@@ -1,15 +1,19 @@
 import type { Metadata, Viewport } from 'next'
 
+import { getMessages } from '@/lib/i18n'
+
 import './globals.css'
 import { Geist } from 'next/font/google'
 import { cn } from '@/lib/utils'
 
 const geist = Geist({ subsets: ['latin'], variable: '--font-sans' })
 
-export const metadata: Metadata = {
-  title: 'NeteaseCloudMusic MCP',
-  description:
-    'A stateless Model Context Protocol server for the NetEase Cloud Music API, with a built-in OAuth 2.1 authorization server.',
+export async function generateMetadata(): Promise<Metadata> {
+  const { messages } = await getMessages()
+  return {
+    title: messages.meta.title,
+    description: messages.meta.description,
+  }
 }
 
 export const viewport: Viewport = {
@@ -21,9 +25,10 @@ export const viewport: Viewport = {
   initialScale: 1,
 }
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export default async function RootLayout({ children }: { children: React.ReactNode }) {
+  const { locale } = await getMessages()
   return (
-    <html lang="zh-CN" className={cn('dark font-sans', geist.variable)}>
+    <html lang={locale} className={cn('dark font-sans', geist.variable)}>
       <body className="antialiased">{children}</body>
     </html>
   )

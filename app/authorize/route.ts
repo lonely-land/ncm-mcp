@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { NextResponse } from 'next/server'
 
 import { mcpResourceUrl } from '@/lib/config'
+import { format, messagesFromRequest } from '@/lib/i18n'
 import { assertRedirectAllowed, ClientError, normalizeScope, resolveClient } from '@/lib/oauth/credentials'
 import { AUTHZ_COOKIE, authzCookieOptions } from '@/lib/oauth/authorize-flow'
 import { sealAuthRequest } from '@/lib/oauth/tokens'
@@ -27,21 +28,24 @@ function failure(request: Request, code: string, message: string): NextResponse 
  */
 export async function GET(request: Request): Promise<NextResponse> {
   const params = new URL(request.url).searchParams
+  const text = messagesFromRequest(request).oauth
 
   if (params.get('response_type') !== 'code') {
-    return failure(request, 'unsupported_response_type', 'Only response_type=code is supported.')
+    return failure(request, 'unsupported_response_type', text.unsupportedResponseType)
   }
 
   const clientId = params.get('client_id')
   if (!clientId) {
-    return failure(request, 'invalid_request', 'This link is missing a client_id.')
+    return failure(request, 'invalid_request', text.clientIdRequired)
   }
 
   let client
   try {
     client = await resolveClient(clientId)
   } catch (error) {
-    if (error instanceof ClientError) return failure(request, error.code, error.description)
+    if (error instanceof ClientError) {
+      return failure(request, error.code, text[error.descriptionKey])
+    }
     throw error
   }
 
@@ -49,17 +53,19 @@ export async function GET(request: Request): Promise<NextResponse> {
   try {
     assertRedirectAllowed(client, redirectUri)
   } catch (error) {
-    if (error instanceof ClientError) return failure(request, error.code, error.description)
+    if (error instanceof ClientError) {
+      return failure(request, error.code, text[error.descriptionKey])
+    }
     throw error
   }
 
   const codeChallenge = params.get('code_challenge')
   const codeChallengeMethod = params.get('code_challenge_method') ?? 'S256'
   if (!codeChallenge) {
-    return failure(request, 'invalid_request', 'PKCE is required, but this link has no code_challenge.')
+    return failure(request, 'invalid_request', text.pkceRequired)
   }
   if (codeChallengeMethod !== 'S256') {
-    return failure(request, 'invalid_request', 'Only code_challenge_method=S256 is supported.')
+    return failure(request, 'invalid_request', text.pkceS256Only)
   }
 
   const expectedResource = mcpResourceUrl().href
@@ -70,7 +76,7 @@ export async function GET(request: Request): Promise<NextResponse> {
       return failure(
         request,
         'invalid_target',
-        `This server only issues tokens for ${expectedResource}.`,
+        format(text.invalidTarget, { resource: expectedResource }),
       )
     }
   }
@@ -88,7 +94,8 @@ export async function GET(request: Request): Promise<NextResponse> {
   })
 
   const target = new URL(LOGIN_PAGE, request.url)
-  target.searchParams.set('client', client.clientName ?? 'an MCP client')
+  // Omit an unnamed client so the login page can substitute its own localized default.
+  if (client.clientName) target.searchParams.set('client', client.clientName)
   target.searchParams.set('scope', scope)
 
   const response = NextResponse.redirect(target)

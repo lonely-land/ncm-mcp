@@ -1,4 +1,5 @@
 import { LoginScreen } from '@/app/oauth/login-screen'
+import { getMessages } from '@/lib/i18n'
 import { readAuthzCookie } from '@/lib/oauth/authorize-flow'
 
 export const runtime = 'nodejs'
@@ -14,13 +15,16 @@ export default async function LoginPage({
   searchParams: Promise<{ error?: string; message?: string; client?: string; scope?: string }>
 }) {
   const params = await searchParams
+  const { messages } = await getMessages()
+  const clientName = params.client ?? messages.login.unknownClient
 
   if (params.error) {
     return (
       <LoginScreen
-        clientName={params.client ?? 'this client'}
+        messages={messages.login}
+        clientName={clientName}
         scope={params.scope ?? ''}
-        error={{ code: params.error, message: params.message ?? 'The authorization request was rejected.' }}
+        error={{ code: params.error, message: params.message ?? messages.login.errorScreen.fallback }}
       />
     )
   }
@@ -29,16 +33,13 @@ export default async function LoginPage({
   if (!authz) {
     return (
       <LoginScreen
-        clientName={params.client ?? 'this client'}
+        messages={messages.login}
+        clientName={clientName}
         scope={params.scope ?? ''}
-        error={{
-          code: 'session_expired',
-          message:
-            'This sign-in link has expired or the cookie was lost. Close this tab and reconnect from your MCP client.',
-        }}
+        error={{ code: 'session_expired', message: messages.login.client.sessionExpired }}
       />
     )
   }
 
-  return <LoginScreen clientName={params.client ?? 'an MCP client'} scope={authz.scope} />
+  return <LoginScreen messages={messages.login} clientName={clientName} scope={authz.scope} />
 }
