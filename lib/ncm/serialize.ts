@@ -164,6 +164,49 @@ export function trimText(text: string, max: number): string {
 }
 
 /**
+ * Ceilings for free-form text that arrives in bulk (lyrics, bios, descriptions).
+ * A single call must never be able to spend the whole context window on one field,
+ * so anything longer is cut and says so.
+ */
+export const TEXT_LIMITS = {
+  /** Lyrics bodies (plain, translated, romanised, LRC). */
+  lyrics: 4000,
+  /** Lyrics marks / highlight blobs. */
+  lyricMark: 1200,
+  /** Descriptions, signatures, bios. */
+  description: 600,
+  /** Any other long string in a generic payload. */
+  field: 1200,
+  /** Whole serialised tool result written as JSON. */
+  result: 12000,
+  /** Raw escape-hatch results. */
+  raw: 16000,
+} as const
+
+/** Cut `text` at `max` characters and append a marker naming what was dropped. */
+export function capText(text: string, max: number = TEXT_LIMITS.field): string {
+  if (typeof text !== 'string') return text
+  if (text.length <= max) return text
+  return `${text.slice(0, max)}\n…[truncated: ${text.length - max} of ${text.length} characters dropped; request a smaller slice or use paging]`
+}
+
+/**
+ * Cap every string in a nested payload and note each truncation in place, so a
+ * verbose field cannot dominate a JSON result.
+ */
+export function capTextFields(value: Json, max: number = TEXT_LIMITS.field, depth = 0): Json {
+  if (depth > 6) return value
+  if (typeof value === 'string') return capText(value, max)
+  if (Array.isArray(value)) return value.map((entry) => capTextFields(entry, max, depth + 1))
+  if (value && typeof value === 'object') {
+    const out: Json = {}
+    for (const [key, entry] of Object.entries(value)) out[key] = capTextFields(entry, max, depth + 1)
+    return out
+  }
+  return value
+}
+
+/**
  * Generic deep trim for endpoints that have no dedicated normalizer: removes the heavy
  * key set at any depth and caps arrays so a search page cannot blow the budget.
  */
@@ -179,8 +222,8 @@ export function trimGeneric(value: Json, depth = 0, maxArray = 50): Json {
     for (const [key, entry] of Object.entries(value)) {
       if (ALWAYS_DROP.has(key) || HEAVY_KEYS.has(key)) continue
       if (entry === null || entry === undefined) continue
-      if (typeof entry === 'string' && entry.length > 2000) {
-        out[key] = trimText(entry, 2000)
+      if (typeof entry === 'string' && entry.length > TEXT_LIMITS.field) {
+        out[key] = capText(entry, TEXT_LIMITS.field)
         continue
       }
       out[key] = trimGeneric(entry, depth + 1, maxArray)
@@ -195,4 +238,18 @@ export function toToolText(body: Json, limit = 12000): string {
   const text = typeof body === 'string' ? body : JSON.stringify(body, null, 2)
   if (text.length <= limit) return text
   return `${text.slice(0, limit)}\n…truncated (${text.length - limit} chars omitted)`
+}
+
+/**
+ * Serialize with a ceiling that protects the tail: the final `tailLines` lines
+ * (where paging metadata lives) survive truncation, so a huge payload can never
+ * hide how to ask for the next page.
+ */
+export function toToolTextKeepingTail(body: Json, limit = 12000, tailLines = 12): string {
+  const text = typeof body === 'string' ? body : JSON.stringify(body, null, 2)
+  if (text.length <= limit) return text
+  const tail = text.split('\n').slice(-tailLines).join('\n')
+  const budget = Math.max(0, limit - tail.length - 80)
+  const head = text.slice(0, budget)
+  return `${head}\n…truncated (${text.length - head.length - tail.length} chars omitted; paging metadata below)\n${tail}`
 }
