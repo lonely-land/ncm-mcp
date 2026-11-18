@@ -83,7 +83,14 @@ async function main() {
   )
   check('AS advertises CIMD', as.body?.client_id_metadata_document_supported === true)
 
-  section('2. Unauthenticated MCP request')
+  section('2. Health probe')
+  const health = await json(`${BASE}/healthz`)
+  check('healthz returns 200', health.response.status === 200, `status ${health.response.status}`)
+  check('healthz reports ok', health.body?.status === 'ok', JSON.stringify(health.body).slice(0, 120))
+  check('healthz reports uptime', typeof health.body?.uptime === 'number', String(health.body?.uptime))
+  check('healthz reports a version', typeof health.body?.version === 'string' && health.body.version.length > 0)
+
+  section('3. Unauthenticated MCP request')
   const challenge = await fetch(`${BASE}/mcp`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
@@ -94,7 +101,7 @@ async function main() {
   check('challenge points at the PRM document', wwwAuth.includes('resource_metadata='), wwwAuth)
   check('challenge names the scope', wwwAuth.includes('scope='), wwwAuth)
 
-  section('3. Dynamic client registration')
+  section('4. Dynamic client registration')
   const registration = await json(`${BASE}/register`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -116,7 +123,7 @@ async function main() {
   })
   check('registration rejects empty redirect_uris', rejected.response.status === 400, `status ${rejected.response.status}`)
 
-  section('4. Authorization request')
+  section('5. Authorization request')
   const { verifier, challenge: codeChallenge } = await pkcePair()
   const state = 'e2e-state-value'
   const authorizeUrl = new URL(`${BASE}/authorize`)
@@ -162,7 +169,7 @@ async function main() {
     `${noPkceResponse.status} ${noPkceResponse.headers.get('location')?.slice(0, 90)}`,
   )
 
-  section('5. Login completion')
+  section('6. Login completion')
   // A real NetEase session requires a human (QR scan or credentials). The default
   // synthetic jar lets the rest of the flow — code minting, token exchange, MCP calls —
   // be verified end to end; pass NCM_E2E_JAR to exercise a live account.
@@ -200,7 +207,7 @@ async function main() {
   const code = redirect.searchParams.get('code')
   check('redirect carries an authorization code', Boolean(code))
 
-  section('6. Token exchange')
+  section('7. Token exchange')
   const tokenResponse = await fetch(`${BASE}/token`, {
     method: 'POST',
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -256,7 +263,7 @@ async function main() {
   const refreshedBody = await refreshed.json().catch(() => ({}))
   check('refresh grant returns a new access token', refreshed.status === 200 && Boolean(refreshedBody.access_token), `status ${refreshed.status}`)
 
-  section('7. Authenticated MCP calls')
+  section('8. Authenticated MCP calls')
   const accessToken = refreshedBody.access_token ?? tokens.access_token
   const mcpCall = async (method, params) => {
     const response = await fetch(`${BASE}/mcp`, {

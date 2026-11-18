@@ -1,3 +1,4 @@
+import { format, localeFromRequest, messagesFor } from '@/lib/i18n'
 import { jsonResponse, oauthError } from '@/lib/oauth/server'
 import { sealClientRegistration } from '@/lib/oauth/tokens'
 
@@ -19,24 +20,29 @@ const ALLOWED_GRANTS = new Set(['authorization_code', 'refresh_token'])
  * sealed JWE describing the client, so any instance can validate it later.
  */
 export async function POST(request: Request): Promise<Response> {
+  const text = messagesFor(localeFromRequest(request)).oauth
+
   let body: RegistrationRequest
   try {
     body = (await request.json()) as RegistrationRequest
   } catch {
-    return oauthError('invalid_client_metadata', 'Body must be JSON')
+    return oauthError('invalid_client_metadata', text.bodyMustBeJson)
   }
 
   const redirectUris = Array.isArray(body.redirect_uris)
     ? body.redirect_uris.filter((entry): entry is string => typeof entry === 'string')
     : []
   if (redirectUris.length === 0) {
-    return oauthError('invalid_redirect_uri', 'redirect_uris must contain at least one URI')
+    return oauthError('invalid_redirect_uri', text.redirectUrisRequired)
   }
   for (const uri of redirectUris) {
     try {
       new URL(uri)
     } catch {
-      return oauthError('invalid_redirect_uri', `Malformed redirect_uri: ${uri}`)
+      return oauthError(
+        'invalid_redirect_uri',
+        format(text.malformedRedirectUri, { uri }),
+      )
     }
   }
 
@@ -47,10 +53,7 @@ export async function POST(request: Request): Promise<Response> {
     : ['authorization_code', 'refresh_token']
 
   if (body.token_endpoint_auth_method && body.token_endpoint_auth_method !== 'none') {
-    return oauthError(
-      'invalid_client_metadata',
-      'Only public clients (token_endpoint_auth_method=none) are supported',
-    )
+    return oauthError('invalid_client_metadata', text.publicClientsOnly)
   }
 
   const clientId = await sealClientRegistration({

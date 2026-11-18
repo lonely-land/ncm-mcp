@@ -1,5 +1,6 @@
 import { fakeIpFor } from '@/lib/ncm/client'
 import { jarToString } from '@/lib/ncm/cookies'
+import { format, messagesFromRequest } from '@/lib/i18n'
 import { jsonResponse } from '@/lib/oauth/server'
 import { pollQr } from '@/lib/ncm/login'
 import { crossOriginRejection, isSameOrigin } from '@/lib/oauth/same-origin'
@@ -9,15 +10,16 @@ export const dynamic = 'force-dynamic'
 export const maxDuration = 60
 
 export async function POST(request: Request): Promise<Response> {
-  if (!isSameOrigin(request)) return crossOriginRejection()
+  const text = messagesFromRequest(request).api
+  if (!isSameOrigin(request)) return crossOriginRejection(text.crossOrigin)
   let key = ''
   try {
     const body = (await request.json()) as { key?: string }
     key = typeof body.key === 'string' ? body.key : ''
   } catch {
-    return jsonResponse({ ok: false, message: 'Body must be JSON' }, 400)
+    return jsonResponse({ ok: false, message: text.bodyMustBeJson }, 400)
   }
-  if (!key) return jsonResponse({ ok: false, message: 'key is required' }, 400)
+  if (!key) return jsonResponse({ ok: false, message: text.keyRequired }, 400)
 
   try {
     const result = await pollQr(key, fakeIpFor(request))
@@ -42,8 +44,8 @@ export async function POST(request: Request): Promise<Response> {
         status: 502,
         message:
           error instanceof Error
-            ? `Could not check the QR status: ${error.message}`
-            : 'Could not check the QR status',
+            ? format(text.qrStatusFailed, { detail: error.message })
+            : text.qrStatusFailedShort,
       },
       502,
     )

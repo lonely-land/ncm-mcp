@@ -1,6 +1,7 @@
 import {
   SESSION_MAX_AGE_SECONDS,
 } from '@/lib/config'
+import { localeFromRequest, messagesFor } from '@/lib/i18n'
 import { jsonResponse, oauthError } from '@/lib/oauth/server'
 import { normalizeScope } from '@/lib/oauth/credentials'
 import {
@@ -82,28 +83,29 @@ async function readForm(request: Request): Promise<Record<string, string>> {
 }
 
 export async function POST(request: Request): Promise<Response> {
+  const text = messagesFor(localeFromRequest(request)).oauth
   const form = await readForm(request)
   const grantType = form.grant_type
 
   if (grantType === 'authorization_code') {
     const code = form.code
     const codeVerifier = form.code_verifier
-    if (!code) return oauthError('invalid_request', 'code is required')
-    if (!codeVerifier) return oauthError('invalid_request', 'code_verifier is required')
+    if (!code) return oauthError('invalid_request', text.codeRequired)
+    if (!codeVerifier) return oauthError('invalid_request', text.codeVerifierRequired)
 
     const payload = await openAuthorizationCode(code)
-    if (!payload) return oauthError('invalid_grant', 'The authorization code is invalid or expired')
+    if (!payload) return oauthError('invalid_grant', text.codeInvalid)
 
     if (form.client_id && form.client_id !== payload.clientId) {
-      return oauthError('invalid_grant', 'client_id does not match the authorization request')
+      return oauthError('invalid_grant', text.codeClientMismatch)
     }
 
     if (!verifyPkce(codeVerifier, payload.codeChallenge, payload.codeChallengeMethod)) {
-      return oauthError('invalid_grant', 'PKCE verification failed')
+      return oauthError('invalid_grant', text.pkceFailed)
     }
 
     if (!payload.jar) {
-      return oauthError('invalid_grant', 'The authorization code carries no NetEase session')
+      return oauthError('invalid_grant', text.codeNoSession)
     }
 
     return issueTokens({
@@ -118,13 +120,13 @@ export async function POST(request: Request): Promise<Response> {
 
   if (grantType === 'refresh_token') {
     const refreshToken = form.refresh_token
-    if (!refreshToken) return oauthError('invalid_request', 'refresh_token is required')
+    if (!refreshToken) return oauthError('invalid_request', text.refreshTokenRequired)
 
     const payload = await openRefreshToken(refreshToken)
-    if (!payload) return oauthError('invalid_grant', 'The refresh token is invalid or expired')
+    if (!payload) return oauthError('invalid_grant', text.refreshInvalid)
 
     if (form.client_id && form.client_id !== payload.clientId) {
-      return oauthError('invalid_grant', 'client_id does not match the refresh token')
+      return oauthError('invalid_grant', text.refreshClientMismatch)
     }
 
     return issueTokens({
@@ -137,9 +139,10 @@ export async function POST(request: Request): Promise<Response> {
     })
   }
 
-  return oauthError('unsupported_grant_type', 'Supported grant types: authorization_code, refresh_token')
+  return oauthError('unsupported_grant_type', text.unsupportedGrantType)
 }
 
-export function GET(): Response {
-  return oauthError('invalid_request', 'The token endpoint only accepts POST')
+export async function GET(request: Request): Promise<Response> {
+  const text = messagesFor(localeFromRequest(request)).oauth
+  return oauthError('invalid_request', text.tokenPostOnly)
 }

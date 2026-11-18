@@ -1,6 +1,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto'
 
 import { preRegisteredClients } from '@/lib/config'
+import type { OAuthMessageKey } from '@/lib/i18n/messages'
 import { openClientRegistration, type ClientRegistrationPayload } from '@/lib/oauth/tokens'
 
 export interface ResolvedClient {
@@ -14,10 +15,11 @@ export interface ResolvedClient {
 export class ClientError extends Error {
   constructor(
     readonly code: string,
-    readonly description: string,
+    /** Key into the localized `oauth` message table. */
+    readonly descriptionKey: OAuthMessageKey,
     readonly status = 400,
   ) {
-    super(description)
+    super(descriptionKey)
   }
 }
 
@@ -112,7 +114,7 @@ async function fetchClientMetadata(clientId: string): Promise<ResolvedClient | n
  */
 export async function resolveClient(clientId: string): Promise<ResolvedClient> {
   if (!clientId) {
-    throw new ClientError('invalid_client', 'client_id is required')
+    throw new ClientError('invalid_client', 'clientIdRequired')
   }
 
   const preRegistered = preRegisteredClients().get(clientId)
@@ -140,16 +142,16 @@ export async function resolveClient(clientId: string): Promise<ResolvedClient> {
   const cimd = await fetchClientMetadata(clientId)
   if (cimd) return cimd
 
-  throw new ClientError('invalid_client', 'Unknown client_id')
+  throw new ClientError('invalid_client', 'unknownClient')
 }
 
 export function assertRedirectAllowed(client: ResolvedClient, redirectUri: string): void {
   if (!redirectUri) {
-    throw new ClientError('invalid_request', 'redirect_uri is required')
+    throw new ClientError('invalid_request', 'redirectUriRequired')
   }
   const ok = client.redirectUris.some((registered) => redirectUriMatches(redirectUri, registered))
   if (!ok) {
-    throw new ClientError('invalid_request', 'redirect_uri is not registered for this client')
+    throw new ClientError('invalid_request', 'redirectUriNotRegistered')
   }
 }
 

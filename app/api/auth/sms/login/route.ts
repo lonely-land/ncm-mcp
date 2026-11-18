@@ -1,6 +1,7 @@
 import { fakeIpFor } from '@/lib/ncm/client'
 import { jarToString } from '@/lib/ncm/cookies'
 import { loginWithCaptcha } from '@/lib/ncm/login'
+import { messagesFromRequest } from '@/lib/i18n'
 import { jsonResponse } from '@/lib/oauth/server'
 import { crossOriginRejection, isSameOrigin } from '@/lib/oauth/same-origin'
 
@@ -9,18 +10,19 @@ export const dynamic = 'force-dynamic'
 export const maxDuration = 60
 
 export async function POST(request: Request): Promise<Response> {
-  if (!isSameOrigin(request)) return crossOriginRejection()
+  const text = messagesFromRequest(request).api
+  if (!isSameOrigin(request)) return crossOriginRejection(text.crossOrigin)
   let body: { phone?: string; captcha?: string; countrycode?: string }
   try {
     body = (await request.json()) as typeof body
   } catch {
-    return jsonResponse({ ok: false, message: 'Body must be JSON' }, 400)
+    return jsonResponse({ ok: false, message: text.bodyMustBeJson }, 400)
   }
 
   const phone = (body.phone ?? '').trim()
   const captcha = (body.captcha ?? '').trim()
   if (!phone || !captcha) {
-    return jsonResponse({ ok: false, message: 'Phone number and verification code are required' }, 400)
+    return jsonResponse({ ok: false, message: text.phoneAndCodeRequired }, 400)
   }
 
   const outcome = await loginWithCaptcha(

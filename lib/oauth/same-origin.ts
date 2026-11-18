@@ -18,9 +18,11 @@ export function isSameOrigin(request: Request): boolean {
   }
 }
 
-export function crossOriginRejection(): Response {
+export function crossOriginRejection(
+  message = 'Cross-origin requests are not allowed',
+): Response {
   return new Response(
-    JSON.stringify({ ok: false, message: 'Cross-origin requests are not allowed' }),
+    JSON.stringify({ ok: false, message }),
     { status: 403, headers: { 'content-type': 'application/json; charset=utf-8' } },
   )
 }
