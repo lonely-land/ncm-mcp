@@ -1,6 +1,7 @@
 import type { ToolAnnotations } from '@modelcontextprotocol/server'
 import * as z from 'zod'
 
+import { blockedRawEndpoints } from '@/lib/config'
 import { callNcm } from '@/lib/ncm/client'
 import type { CookieJar } from '@/lib/ncm/cookies'
 import {
@@ -429,6 +430,7 @@ const accountTools: ToolDef[] = [
     endpoint: 'daily_signin',
     mapArgs: (args) => ({ type: args.pc ? 1 : 0 }),
     requiresLogin: true,
+    requiresWrite: true,
     render: (body) =>
       body?.code === 200
         ? `Check-in done. Points today: ${body.point ?? 0}`
@@ -444,6 +446,8 @@ const accountTools: ToolDef[] = [
     input: z.object({}),
     annotations: DESTRUCTIVE,
     endpoint: 'logout',
+    requiresLogin: true,
+    requiresWrite: true,
   },
 ]
 
@@ -2062,10 +2066,13 @@ const metaTools: ToolDef[] = [
     annotations: READ_ONLY,
     run: async (args) => {
       const { listEndpointNames } = await import('@/lib/ncm/modules')
+      const blocked = blockedRawEndpoints()
       const all = listEndpointNames()
+      const allowed = all.filter((name) => !blocked.has(name.toLowerCase()))
+      const hidden = all.length - allowed.length
       const filtered = args.filter
-        ? all.filter((name) => name.toLowerCase().includes(String(args.filter).toLowerCase()))
-        : all
+        ? allowed.filter((name) => name.toLowerCase().includes(String(args.filter).toLowerCase()))
+        : allowed
       const { items, meta } = paginate(filtered, args, { defaultPageSize: MAX_PAGE_SIZE })
       const group: PagedGroup = { label: 'endpoints', path: 'endpoints', unit: 'endpoints', meta }
       return {
@@ -2073,7 +2080,9 @@ const metaTools: ToolDef[] = [
           {
             type: 'text',
             text:
-              `${filtered.length} of ${all.length} endpoints:\n${items.join(', ')}` +
+              `${filtered.length} of ${allowed.length} endpoints:` +
+                `${hidden > 0 ? ` (${hidden} hidden: identity mutation and money-spending endpoints)` : ''}\n` +
+              `${items.join(', ')}` +
               `${pagingFooter([group])}`,
           },
         ],
@@ -2086,7 +2095,10 @@ const metaTools: ToolDef[] = [
     title: 'Raw endpoint call',
     description:
       'Call any underlying NetEase endpoint by name with free-form parameters. Read-only endpoints ' +
-      'are always allowed; write endpoints additionally need the ncm:write scope. The payload is ' +
+      'are always allowed; write endpoints additionally need the ncm:write scope. Endpoints that ' +
+      'mutate account identity (profile/avatar/phone/linked-account changes, logout, sign-in, ' +
+      'registration, captcha) or spend money (gifting, paid charts, coin spend, digital albums) ' +
+      'are blocked outright and are not listed by ncm_list_endpoints. The payload is ' +
       `capped at ${TEXT_LIMITS.raw} characters and long text fields at maxChars (default ` +
       `${TEXT_LIMITS.field}); the result says when anything was cut. For offset-capable endpoints ` +
       'pass limit/offset in params yourself.',
@@ -2104,6 +2116,21 @@ const metaTools: ToolDef[] = [
         return {
           isError: true,
           content: [{ type: 'text', text: `Unknown endpoint "${args.endpoint}". Try ncm_list_endpoints.` }],
+        }
+      }
+      if (blockedRawEndpoints().has(args.endpoint.toLowerCase())) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text:
+                `"${args.endpoint}" is blocked and cannot be proxied through ncm_raw. Blocked ` +
+                'endpoints are the ones that mutate account identity (profile, avatar, phone, ' +
+                'linked accounts, session, sign-in/registration) or spend money, and none of them ' +
+                'are reachable from this server. Use the curated tools for anything else.',
+            },
+          ],
         }
       }
       const readSafe = READ_SAFE_RAW.has(args.endpoint)

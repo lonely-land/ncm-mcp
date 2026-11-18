@@ -297,6 +297,42 @@ async function main() {
     console.log('  --   meta toolset disabled, so ncm_raw is intentionally absent')
   }
 
+  // Tool denylist: the default set is empty, so a previously-banned wrapper is listed.
+  // With NCM_E2E_DISABLED_TOOLS=<name> the deployment hides that tool instead.
+  const accountEnabled = tools.some((tool) => tool.name === 'ncm_account_status')
+  if (accountEnabled) {
+    if (process.env.NCM_E2E_DISABLED_TOOLS) {
+      const deniedName = process.env.NCM_E2E_DISABLED_TOOLS.split(',')[0].trim()
+      check(
+        `NCM_E2E_DISABLED_TOOLS tool is absent from tools/list (${deniedName})`,
+        !tools.some((tool) => tool.name === deniedName),
+      )
+      const deniedCall = await mcpCall('tools/call', { name: deniedName, arguments: {} })
+      const deniedText = JSON.stringify(deniedCall.body ?? deniedCall.raw)
+      check(
+        `a denied tool cannot be called by name (${deniedName})`,
+        deniedCall.status !== 200 || /not found|disabled|unknown/i.test(deniedText),
+        deniedText.slice(0, 150),
+      )
+    } else {
+      check(
+        'the default tool denylist hides nothing (ncm_user_binding is listed)',
+        tools.some((tool) => tool.name === 'ncm_user_binding'),
+      )
+    }
+  } else {
+    console.log('  --   account toolset disabled, skipping denylist checks')
+  }
+  const socialEnabled = tools.some((tool) => tool.name === 'ncm_radio_detail')
+  if (socialEnabled) {
+    check(
+      'an enabled social write is still listed (ncm_follow_user)',
+      tools.some((tool) => tool.name === 'ncm_follow_user'),
+    )
+  } else {
+    console.log('  --   social toolset disabled, skipping enabled-write presence check')
+  }
+
   // Pick a tool that exists under whatever NCM_TOOLSETS the deployment enabled.
   const probeName = tools.some((tool) => tool.name === 'ncm_account_status')
     ? 'ncm_account_status'
@@ -323,6 +359,83 @@ async function main() {
     )
   } else {
     console.log('  --   meta toolset disabled, skipping endpoint discovery check')
+  }
+
+  // Raw endpoint blocklist. The default set covers account-identity endpoints, so
+  // ncm_raw must refuse one and ncm_list_endpoints must hide it, while a curated
+  // write endpoint stays reachable. Set NCM_E2E_EMPTY_BLOCKLIST=1 against a server
+  // started with NCM_BLOCKED_RAW_ENDPOINTS= to assert the empty-value semantics.
+  const rawEnabled = tools.some((tool) => tool.name === 'ncm_raw')
+  const blockedEndpoint = process.env.NCM_E2E_BLOCKED_ENDPOINTS?.split(',')[0]?.trim() || 'user_update'
+  const blockedMoney = 'digitalAlbum_ordering'
+  const allowedWrite = 'user_playlist_create'
+  const allowedRead = 'yunbei_receipt'
+  const listNames = async (filter) => {
+    const result = await mcpCall('tools/call', { name: 'ncm_list_endpoints', arguments: { filter, pageSize: 100 } })
+    return result.body?.result?.content?.[0]?.text ?? ''
+  }
+
+  if (rawEnabled && process.env.NCM_E2E_EMPTY_BLOCKLIST === '1') {
+    const allowedText = await listNames(blockedEndpoint)
+    check(
+      `an empty NCM_BLOCKED_RAW_ENDPOINTS blocks nothing (${blockedEndpoint} is listed)`,
+      allowedText.includes(blockedEndpoint),
+      allowedText.slice(0, 140),
+    )
+  } else if (rawEnabled) {
+    const blockedList = await listNames(blockedEndpoint)
+    check(
+      `a blocked endpoint is absent from ncm_list_endpoints (${blockedEndpoint})`,
+      !blockedList.includes(blockedEndpoint),
+      blockedList.slice(0, 140),
+    )
+
+    const blockedCall = await mcpCall('tools/call', {
+      name: 'ncm_raw',
+      arguments: { endpoint: blockedEndpoint, params: {} },
+    })
+    const blockedText = blockedCall.body?.result?.content?.[0]?.text ?? ''
+    check(
+      `ncm_raw rejects a blocked endpoint (${blockedEndpoint})`,
+      /blocked/i.test(blockedText) && /account identity|spend money/i.test(blockedText),
+      blockedText.slice(0, 160),
+    )
+
+    const allowedListing = await listNames(allowedWrite)
+    check(
+      `an allowed write endpoint is not hidden (${allowedWrite})`,
+      allowedListing.includes(allowedWrite),
+      allowedListing.slice(0, 140),
+    )
+    const moneyText = await listNames(blockedMoney)
+    check(
+      `a money-spending endpoint is absent (${blockedMoney})`,
+      !moneyText.includes(blockedMoney),
+      moneyText.slice(0, 140),
+    )
+    const readText = await listNames(allowedRead)
+    check(
+      `a purchase-history read stays allowed (${allowedRead})`,
+      readText.includes(allowedRead),
+      readText.slice(0, 140),
+    )
+    if (!process.env.NCM_E2E_JAR) {
+      // No real jar: the upstream call fails, but the *blocklist* must not be the reason.
+      const allowedCall = await mcpCall('tools/call', {
+        name: 'ncm_raw',
+        arguments: { endpoint: allowedWrite, params: { name: 'e2e-probe', privacy: 10 } },
+      })
+      const allowedText = allowedCall.body?.result?.content?.[0]?.text ?? ''
+      check(
+        `ncm_raw does not block an allowed write endpoint (${allowedWrite})`,
+        allowedCall.status === 200 && Boolean(allowedCall.body?.result) && !/blocked/i.test(allowedText),
+        allowedText.slice(0, 160),
+      )
+    } else {
+      console.log('  --   real jar present, skipping the live allowed-write raw call')
+    }
+  } else {
+    console.log('  --   meta toolset disabled, skipping raw blocklist checks')
   }
 
   // A live upstream read. Guest sessions occasionally trip NetEase's human-verification
