@@ -63,6 +63,7 @@ Set these in the Vercel project, then deploy:
 | --- | --- | --- |
 | `NCM_TOKEN_SECRET` | yes | 16+ chars; `openssl rand -base64 32` |
 | `NCM_TOOLSETS` | no | e.g. `search,music,discover`; default `all` |
+| `NCM_DISABLED_TOOLS` | no | tool names to hide, e.g. `ncm_listen_stats,ncm_yunbei`; default is the account/session deny set (see [Tool denylist](#tool-denylist)) |
 | `MCP_PUBLIC_ORIGIN` | no | only for a custom domain |
 | `NCM_FALLBACK_RANDOM_CN_IP` | no | see [FakeIP](#fakeip) |
 
@@ -113,7 +114,24 @@ npx @modelcontextprotocol/inspector --cli https://<your-deployment>/mcp --transp
 | `social` | 10 | follow users, subscribe artists/MV/radio, DMs, activity feed, share |
 | `meta` | 3 | `ncm_list_endpoints`, `ncm_raw`, `ncm_about` |
 
-`ncm_raw` reaches all 451 endpoints. Read-only ones are always allowed; everything else needs the `ncm:write` scope, which triggers a step-up authorization challenge.
+Counts are the registered totals; `NCM_DISABLED_TOOLS` may hide some of them (nine account/session tools by default), and `NCM_TOOLSETS` may drop whole groups.
+
+`ncm_raw` reaches all 451 endpoints. Read-only ones are always allowed; any other endpoint needs the `ncm:write` scope, and without it the call returns an error asking the caller to acquire that scope — it does not run a step-up challenge. Only the curated write tools (`scopeChallenge` on registration) take the step-up path.
+
+### Tool denylist
+
+`NCM_DISABLED_TOOLS` takes a comma-separated list of tool names and subtracts them from whatever `NCM_TOOLSETS` enables. A denied tool never appears in `tools/list` and has no registered handler, so calling it by name fails. Unknown names are ignored with a single startup warning rather than an error.
+
+When `NCM_DISABLED_TOOLS` is unset the default deny set is the account personal-info / session-identity group, exported as `DEFAULT_DISABLED_TOOLS` from `lib/config.ts` so it stays discoverable and testable:
+
+```
+ncm_account_profile, ncm_user_binding, ncm_vip_info, ncm_yunbei, ncm_user_level,
+ncm_user_counts, ncm_listen_stats, ncm_logout, ncm_daily_signin
+```
+
+Setting the variable replaces that list entirely; `NCM_DISABLED_TOOLS=` (empty) disables nothing. Social, favorite and playlist writes — follow, like, comment, share, playlist create/delete/remove/add/reorder/rename — stay enabled.
+
+Trade-off worth stating plainly: the denylist gates the convenience wrappers, not the transport. `ncm_raw` can still reach the upstream endpoints behind a denied tool, and a caller holding `ncm:write` can use it for the same effect. That is accepted: the wrappers are what a model reaches for unprompted, and raw passthrough is the deliberate escape hatch.
 
 ### Scopes
 

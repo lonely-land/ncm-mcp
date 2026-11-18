@@ -429,6 +429,7 @@ const accountTools: ToolDef[] = [
     endpoint: 'daily_signin',
     mapArgs: (args) => ({ type: args.pc ? 1 : 0 }),
     requiresLogin: true,
+    requiresWrite: true,
     render: (body) =>
       body?.code === 200
         ? `Check-in done. Points today: ${body.point ?? 0}`
@@ -444,6 +445,8 @@ const accountTools: ToolDef[] = [
     input: z.object({}),
     annotations: DESTRUCTIVE,
     endpoint: 'logout',
+    requiresLogin: true,
+    requiresWrite: true,
   },
 ]
 

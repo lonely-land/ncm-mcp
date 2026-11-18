@@ -91,6 +91,38 @@ export function enabledToolsets(): Set<string> | 'all' {
   )
 }
 
+/**
+ * Tools hidden when `NCM_DISABLED_TOOLS` is unset: the account personal-info and
+ * session-identity wrappers. Setting the variable replaces this list entirely, so
+ * `NCM_DISABLED_TOOLS=` disables nothing. Names are lower-cased tool names.
+ */
+export const DEFAULT_DISABLED_TOOLS: readonly string[] = [
+  'ncm_account_profile',
+  'ncm_user_binding',
+  'ncm_vip_info',
+  'ncm_yunbei',
+  'ncm_user_level',
+  'ncm_user_counts',
+  'ncm_listen_stats',
+  'ncm_logout',
+  'ncm_daily_signin',
+]
+
+/**
+ * Per-tool denylist, subtracted from whatever `NCM_TOOLSETS` enables. An unset
+ * variable means `DEFAULT_DISABLED_TOOLS`; a set one — including an empty value —
+ * is used verbatim, so an empty list disables nothing.
+ */
+export function disabledTools(): Set<string> {
+  const raw = process.env.NCM_DISABLED_TOOLS
+  const names = raw === undefined ? DEFAULT_DISABLED_TOOLS : raw.split(',')
+  return new Set(
+    names
+      .map((entry) => entry.trim().toLowerCase())
+      .filter(Boolean),
+  )
+}
+
 export const FALLBACK_RANDOM_CN_IP = process.env.NCM_FALLBACK_RANDOM_CN_IP === 'true'
 
 /** Extra pre-registered clients: `client_id:redirect_uri[,redirect_uri]` pairs. */

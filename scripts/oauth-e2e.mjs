@@ -297,6 +297,36 @@ async function main() {
     console.log('  --   meta toolset disabled, so ncm_raw is intentionally absent')
   }
 
+  // Denylist: a default-denied tool must disappear from tools/list and have no
+  // registered handler, while an enabled social write stays available. Both checks
+  // are skipped when the surrounding deployment has the relevant toolset off.
+  const defaultDenied = 'ncm_user_binding'
+  const accountEnabled = tools.some((tool) => tool.name === 'ncm_account_status')
+  if (accountEnabled) {
+    check(
+      `a default-denied tool is absent from tools/list (${defaultDenied})`,
+      !tools.some((tool) => tool.name === defaultDenied),
+    )
+    const deniedCall = await mcpCall('tools/call', { name: defaultDenied, arguments: {} })
+    const deniedText = JSON.stringify(deniedCall.body ?? deniedCall.raw)
+    check(
+      `a denied tool cannot be called by name (${defaultDenied})`,
+      deniedCall.status !== 200 || /not found|disabled|unknown/i.test(deniedText),
+      deniedText.slice(0, 150),
+    )
+  } else {
+    console.log('  --   account toolset disabled, skipping denylist checks')
+  }
+  const socialEnabled = tools.some((tool) => tool.name === 'ncm_radio_detail')
+  if (socialEnabled) {
+    check(
+      'an enabled social write is still listed (ncm_follow_user)',
+      tools.some((tool) => tool.name === 'ncm_follow_user'),
+    )
+  } else {
+    console.log('  --   social toolset disabled, skipping enabled-write presence check')
+  }
+
   // Pick a tool that exists under whatever NCM_TOOLSETS the deployment enabled.
   const probeName = tools.some((tool) => tool.name === 'ncm_account_status')
     ? 'ncm_account_status'

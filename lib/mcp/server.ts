@@ -1,10 +1,46 @@
 import { McpServer, requireScopes, type AuthInfo } from '@modelcontextprotocol/server'
 
-import { SCOPES, enabledToolsets } from '@/lib/config'
+import { SCOPES, disabledTools, enabledToolsets } from '@/lib/config'
 import { parseCookieString, type CookieJar } from '@/lib/ncm/cookies'
 import { ALL_TOOLS, runTool, type ToolDef, type ToolRuntime } from '@/lib/mcp/registry'
 
 const WRITE_CHALLENGE = requireScopes(SCOPES.read, SCOPES.write)
+
+/** Names the denylist can match against, lower-cased once per module load. */
+const KNOWN_TOOL_NAMES = new Set(ALL_TOOLS.map((tool) => tool.name.toLowerCase()))
+
+let denylistChecked = false
+
+/**
+ * Warn once per process about denylist entries that match no registered tool, so a
+ * typo in `NCM_DISABLED_TOOLS` is visible without failing the request.
+ */
+function warnUnknownDisabledTools(disabled: Set<string>): void {
+  if (denylistChecked) return
+  denylistChecked = true
+  const unknown = Array.from(disabled).filter((name) => !KNOWN_TOOL_NAMES.has(name))
+  if (unknown.length > 0) {
+    console.warn(
+      `NCM_DISABLED_TOOLS ignores ${unknown.length} unknown tool name(s): ${unknown.join(', ')}`,
+    )
+  }
+}
+
+/**
+ * The tools this deployment exposes: the `NCM_TOOLSETS` selection minus the
+ * `NCM_DISABLED_TOOLS` denylist. Both the registration loop and the instruction
+ * block read this, so a denied tool is neither listed nor callable.
+ */
+export function visibleTools(): ToolDef[] {
+  const enabled = enabledToolsets()
+  const byToolset =
+    enabled === 'all' ? ALL_TOOLS : ALL_TOOLS.filter((tool) => enabled.has(tool.toolset))
+
+  const disabled = disabledTools()
+  if (disabled.size === 0) return byToolset
+  warnUnknownDisabledTools(disabled)
+  return byToolset.filter((tool) => !disabled.has(tool.name.toLowerCase()))
+}
 
 export interface SessionContext {
   jar: CookieJar
@@ -25,12 +61,6 @@ export function sessionFromAuthInfo(authInfo: AuthInfo | undefined, request: Req
     nickname: typeof extra.nickname === 'string' ? extra.nickname : undefined,
     scope: authInfo?.scopes?.join(' ') ?? SCOPES.read,
   }
-}
-
-function visibleTools(): ToolDef[] {
-  const enabled = enabledToolsets()
-  if (enabled === 'all') return ALL_TOOLS
-  return ALL_TOOLS.filter((tool) => enabled.has(tool.toolset))
 }
 
 /** Short instruction block MCP clients surface to the model before the tool list. */
