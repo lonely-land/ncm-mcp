@@ -112,6 +112,36 @@ const PAGING_PROBES = [
 ]
 
 /**
+ * Probes for the total-reporting rule:
+ *
+ * - `more`: a page that still has more must keep `total unknown` when the upstream sent
+ *   no count. Inventing one mid-collection is the opposite error.
+ * - `lastPage`: walk to the page that ends the collection; it must state an exact total
+ *   equal to `offset + returned`. "total unknown" there is the bug this check exists for.
+ *
+ * Guest sessions trip NetEase's verification gate on individual endpoints, so a
+ * `lastPage` probe lists alternatives that exercise the same rule; it is skipped only
+ * when every one of them is gated.
+ */
+const TOTAL_PROBES = [
+  // Offset mode, `more` flag but no count: page 1 of a long list has more, no total.
+  { name: 'ncm_top_artists', args: {}, rowsPath: 'artists', more: { page: 1, pageSize: 5 } },
+  // Offset mode over endpoints that send neither a count nor a more flag.
+  {
+    alternatives: [
+      { name: 'ncm_artist_albums', args: { id: 6452 }, rowsPath: 'hotAlbums' },
+      { name: 'ncm_playlist_tracks', args: { id: 24381616 }, rowsPath: 'songs' },
+      // This one does carry a count, so its total may legitimately equal the offset on
+      // an empty page; the past-the-end guard only applies to a derived total.
+      { name: 'ncm_new_albums', args: {}, rowsPath: 'albums', counted: true },
+    ],
+    lastPage: { pageSize: 100 },
+  },
+  // Local mode: the list arrives whole, so the last page's arithmetic is the only stake.
+  { name: 'ncm_toplist', args: {}, rowsPath: 'list', lastPage: { pageSize: 20 } },
+]
+
+/**
  * Stress calls: the arguments that used to produce an oversized or severed result.
  * Each is checked for its ceiling and for parseable JSON; these are the cases where a
  * "pass" on a normal-sized sample would hide the defect.
@@ -304,10 +334,100 @@ async function checkTiling(probe, pageSize, firstMeta) {
 function footerMeta(footer) {
   const hasMore = /hasMore=(true|false)/.exec(footer)
   const total = /of (\d+)/.exec(footer)
+  const range = /items (\d+)-(\d+) of (\d+)/.exec(footer)
   return {
     hasMore: hasMore ? hasMore[1] === 'true' : undefined,
-    total: total ? Number(total[1]) : undefined,
+    total: total ? Number(total[1]) : range ? Number(range[3]) : undefined,
+    offset: range ? Number(range[1]) - 1 : undefined,
+    saysUnknown: /total unknown/.test(footer),
   }
+}
+
+/**
+ * Assert one total-reporting probe.
+ *
+ * `more` — a mid-collection page with no upstream count must say `total unknown` and
+ * must not claim a number it cannot know.
+ * `lastPage` — walk to the page that ends the collection; it must report an exact total
+ * equal to `offset + returned`, and the walk must not have claimed a total earlier.
+ */
+async function checkTotals(probe) {
+  if (probe.alternatives) {
+    // Try each endpoint in turn; a gated one is not evidence about the paging rule.
+    const gated = []
+    for (const candidate of probe.alternatives) {
+      const verdict = await checkTotals({ ...candidate, lastPage: probe.lastPage })
+      if (verdict.skip) {
+        gated.push(candidate.name)
+        continue
+      }
+      return { ...verdict, detail: `${candidate.name}: ${verdict.detail}` }
+    }
+    return { skip: `every candidate was gated (${gated.join(', ')})` }
+  }
+
+  if (probe.more) {
+    const { page, pageSize } = probe.more
+    const result = await callTool(probe.name, { ...probe.args, page, pageSize })
+    if (result.isError) return { skip: 'upstream needs a login or risk gate' }
+    const parsed = rowsOf({ text: result.text, rowsPath: probe.rowsPath })
+    const footer = footerMeta(parsed.footer)
+    const hasMore = parsed.meta?.hasMore ?? footer.hasMore
+    const total = parsed.meta?.total ?? footer.total
+    if (hasMore !== true) {
+      return { ok: false, detail: `page ${page} of pageSize=${pageSize} is not mid-collection (hasMore=${hasMore})` }
+    }
+    if (total !== undefined) {
+      return { ok: false, detail: `page ${page} has more but claims total=${total}; a live collection has no exact total` }
+    }
+    if (!parsed.meta && !footer.saysUnknown) {
+      return { ok: false, detail: `page ${page} has more but the footer hides that the total is unknown` }
+    }
+    return { ok: true, detail: `page ${page} has more and reports total unknown, as it must` }
+  }
+
+  const pageSize = probe.lastPage.pageSize
+  for (let page = 1; page <= 20; page += 1) {
+    const result = await callTool(probe.name, { ...probe.args, page, pageSize })
+    if (result.isError) return { skip: 'upstream needs a login or risk gate' }
+    const parsed = rowsOf({ text: result.text, rowsPath: probe.rowsPath })
+    const footer = footerMeta(parsed.footer)
+    const returned = parsed.rows.length
+    const offset = (page - 1) * pageSize
+    const hasMore = parsed.meta?.hasMore ?? footer.hasMore
+    const total = parsed.meta?.total ?? footer.total
+    if (returned > pageSize) {
+      return { ok: false, detail: `page ${page} returned ${returned} rows for pageSize=${pageSize}` }
+    }
+    if (hasMore === true) {
+      // Mid-collection: a total is allowed (local lists and counted endpoints know it),
+      // but it may never be a number this page cannot support.
+      if (total !== undefined && total < offset + returned) {
+        return {
+          ok: false,
+          detail: `page ${page} has more but reports total=${total}, below what it already returned (${offset + returned})`,
+        }
+      }
+      continue
+    }
+    if (returned === 0) {
+      // Past the end of an uncounted collection: the offset is an upper bound, never the
+      // count. A count the upstream actually sent is authoritative and may equal it.
+      if (!probe.counted && offset > 0 && total === offset) {
+        return { ok: false, detail: `page ${page} is past the end but reports the offset (${offset}) as the total` }
+      }
+      return { ok: true, detail: `walked to empty page ${page}, which reported no misleading total` }
+    }
+    const expected = offset + returned
+    if (total === undefined) {
+      return { ok: false, detail: `last page ${page} reports "total unknown" instead of ${expected}` }
+    }
+    if (total !== expected) {
+      return { ok: false, detail: `last page ${page} reports total=${total}, expected offset+returned=${expected}` }
+    }
+    return { ok: true, detail: `last page ${page} (${returned} rows) reports exact total ${total}` }
+  }
+  return { skip: `collection longer than 20 pages at pageSize=${pageSize}` }
 }
 
 async function callTool(name, toolArgs) {
@@ -409,6 +529,23 @@ async function main() {
     })
   }
 
+  // --- Total reporting -----------------------------------------------------
+  // A finished collection knows its size; a collection with more to come does not.
+  const totalChecks = []
+  for (const probe of TOTAL_PROBES) {
+    // A probe names either its own tool or a list of interchangeable candidates.
+    const names = probe.alternatives ? probe.alternatives.map((entry) => entry.name) : [probe.name]
+    if (!names.some((name) => tools.some((tool) => tool.name === name))) continue
+    const verdict = await checkTotals(probe)
+    const label = names.length > 1 ? 'last page (offset mode)' : probe.name
+    if (verdict.skip) {
+      totalChecks.push({ name: label, verdict: 'skip', detail: verdict.skip })
+      continue
+    }
+    if (!verdict.ok) failures += 1
+    totalChecks.push({ name: label, verdict: verdict.ok ? 'ok' : 'FAIL', detail: verdict.detail })
+  }
+
   // --- Stress pass ---------------------------------------------------------
   // The oversized cases: a normal-sized sample can pass while the worst case still
   // severs JSON or blows past the ceiling.
@@ -497,6 +634,15 @@ async function main() {
     checks += pagingChecks.length
   }
 
+  if (totalChecks.length > 0) {
+    console.log('\nTotal reporting')
+    for (const check of totalChecks) {
+      const mark = check.verdict === 'FAIL' ? 'FAIL' : check.verdict === 'ok' ? ' ok ' : ' -- '
+      console.log(`${mark} ${check.name.padEnd(26)} ${check.detail}`)
+    }
+    checks += totalChecks.length
+  }
+
   if (stressChecks.length > 0) {
     console.log('\nOversize stress')
     for (const check of stressChecks) {
@@ -513,12 +659,16 @@ async function main() {
   const skipped = rows.filter((row) => row.verdict === 'no-sample').length
   const stressFailed = stressChecks.filter((check) => check.verdict === 'FAIL').length
   const pagingFailed = pagingChecks.filter((check) => check.verdict === 'FAIL').length
+  const totalFailed = totalChecks.filter((check) => check.verdict === 'FAIL').length
   console.log(
     `${checks} checks · ${ok} tools ok · ${loginRequired} need a real login · ${failures} failed · ` +
       `${oversized} oversized (>${DEFAULT_CEILING} chars) · ${invalidJson} invalid JSON · ` +
       `${skipped} without a sample call`,
   )
-  console.log(`paging failures: ${pagingFailed} · oversize failures: ${stressFailed}`)
+  console.log(
+    `paging failures: ${pagingFailed} · total-reporting failures: ${totalFailed} · ` +
+      `oversize failures: ${stressFailed}`,
+  )
   if (failures > 0 || oversized > 0 || invalidJson > 0) process.exitCode = 1
 }
 

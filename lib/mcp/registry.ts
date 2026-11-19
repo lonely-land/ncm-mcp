@@ -37,6 +37,7 @@ import {
   pagingShape,
   paginate,
   paginateGroups,
+  takeWindow,
   upstreamWindow,
   type GroupSpec,
   type PageMeta,
@@ -1605,7 +1606,7 @@ const libraryTools: ToolDef[] = [
     description:
       'Playlists owned or collected by the signed-in account. ' +
       `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}) ` +
-      'are applied upstream; the footer reports hasMore.',
+      'are applied upstream; the footer reports hasMore and, on the last page, the exact total.',
     input: z.object({ ...paging }),
     annotations: READ_ONLY,
     endpoint: 'user_playlist',
@@ -1622,9 +1623,13 @@ const libraryTools: ToolDef[] = [
       if (!result.ok) {
         return { isError: true, content: [{ type: 'text', text: `Failed: ${result.body?.message ?? result.status}` }] }
       }
-      const lists = result.body?.playlist ?? []
+      // The window requested is exactly the window reported: an endpoint that answers
+      // `limit` with `limit + 1` rows must not push one row into the next page, and
+      // the extra row is itself proof that more exist.
+      const req = pageRequest(args)
+      const { items: lists, overDelivered } = takeWindow(result.body?.playlist ?? [], req.pageSize)
       const more = typeof result.body?.more === 'boolean' ? result.body.more : undefined
-      const meta = pageMeta(pageRequest(args), lists.length, { hasMore: more })
+      const meta = pageMeta(req, lists.length, { hasMore: overDelivered ? true : more })
       const group: PagedGroup = { label: 'playlists', path: 'playlist', unit: 'playlists', meta }
       const text =
         lists
@@ -1817,7 +1822,11 @@ const libraryTools: ToolDef[] = [
 function renderCommentPage(comments: any[], meta: PageMeta, total?: number): string {
   const unit = 'comments'
   const group: PagedGroup = { label: unit, path: 'comments', unit, meta }
-  const header = `${total ?? 'unknown'} comments in total`
+  // The footer already states the total; this header only says it once, from the same
+  // value, so a finished collection never reads "unknown" in one place and exact in
+  // the other.
+  const known = total ?? meta.total
+  const header = `${known ?? 'unknown'} comments in total`
   if (comments.length === 0) return `${header}\n${pagingEmptyNote(meta, unit)}${pagingFooter([group])}`
   const lines = comments.map(
     (c: any) =>
@@ -1887,10 +1896,17 @@ const commentTools: ToolDef[] = [
       if (!result.ok) {
         return { isError: true, content: [{ type: 'text', text: `Failed: ${result.body?.message ?? result.status}` }] }
       }
-      const comments = (result.body?.comments ?? []).map(slimComment)
+      const req = pageRequest(args)
+      const { items: comments, overDelivered } = takeWindow(
+        (result.body?.comments ?? []).map(slimComment),
+        req.pageSize,
+      )
       const total = typeof result.body?.total === 'number' ? result.body.total : undefined
       const more = typeof result.body?.more === 'boolean' ? result.body.more : undefined
-      const meta = pageMeta(pageRequest(args), comments.length, { total, hasMore: more })
+      const meta = pageMeta(req, comments.length, {
+        total,
+        hasMore: overDelivered ? true : more,
+      })
       return {
         content: [
           {
