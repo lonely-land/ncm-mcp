@@ -7,17 +7,23 @@ import { callNcm } from '@/lib/ncm/client'
 import type { CookieJar } from '@/lib/ncm/cookies'
 import { UID_DIAGNOSTIC } from '@/lib/ncm/uid'
 import {
+  MAX_TOOL_TEXT,
+  MAX_TEXT_FIELD_CHARS,
   TEXT_LIMITS,
   capText,
   capTextFields,
+  clampTextLimit,
+  enforceCeiling,
   slimComment,
   slimPlaylist,
   slimSong,
   slimUser,
-  toToolText,
-  toToolTextKeepingTail,
+  toStructuredText,
   trimGeneric,
+  trimGenericWithNotes,
   trimText,
+  truncateLines,
+  truncateText,
 } from '@/lib/ncm/serialize'
 import {
   DEFAULT_PAGE_SIZE,
@@ -73,6 +79,12 @@ export interface ToolDef {
    * - `local`:  the endpoint returns everything, slice locally
    */
   paging?: ToolPaging
+  /**
+   * Character ceiling for this tool's whole result. Defaults to `TEXT_LIMITS.result`
+   * and is always clamped to `MAX_TOOL_TEXT`, so a tool can ask for a smaller result
+   * but never an unbounded one.
+   */
+  maxTextChars?: number
   requiresWrite?: boolean
   requiresLogin?: boolean
   /**
@@ -81,6 +93,13 @@ export interface ToolDef {
    * (likelist, user_binding); the rest read identity from the cookie upstream.
    */
   ownUidParam?: boolean
+}
+
+/** The ceiling a tool's text must fit, bounded no matter what the definition asks. */
+export function toolCeiling(def: ToolDef): number {
+  const declared = def.maxTextChars
+  if (typeof declared !== 'number' || !Number.isFinite(declared)) return TEXT_LIMITS.result
+  return Math.min(MAX_TOOL_TEXT, Math.max(1000, Math.trunc(declared)))
 }
 
 export type ToolsetName =
@@ -137,6 +156,19 @@ function upstreamParams(def: ToolDef, args: any): Record<string, unknown> {
   return upstreamWindow(req)
 }
 
+/**
+ * The `limit` we actually sent upstream, so an endpoint that answers with `limit+1`
+ * rows can have the extra row trimmed instead of counted as page content.
+ */
+function requestedLimit(def: ToolDef, args: any): number | undefined {
+  const pagingDef = def.paging
+  if (!pagingDef) return undefined
+  const mode = pagingDef.mode ?? 'local'
+  if (mode === 'local') return undefined
+  const req = pageRequest(args, pagingDef.defaultPageSize)
+  return mode === 'limit' ? localFetchLimit(req) : req.pageSize
+}
+
 /** page/pageSize are ours, not the upstream's; never leak them into a request. */
 function stripPagingArgs(params: Record<string, unknown>): Record<string, unknown> {
   if (!('page' in params) && !('pageSize' in params)) return params
@@ -151,6 +183,7 @@ function pageResultBody(def: ToolDef, body: any, args: any): { body: any; groups
   return paginateGroups(body, pagingDef.groups, args, {
     mode: pagingDef.mode ?? 'local',
     defaultPageSize: pagingDef.defaultPageSize,
+    requestedLimit: requestedLimit(def, args),
   })
 }
 
@@ -158,10 +191,12 @@ function pageResultBody(def: ToolDef, body: any, args: any): { body: any; groups
 const maxChars = z
   .number()
   .int()
+  .min(200)
+  .max(MAX_TEXT_FIELD_CHARS)
   .optional()
   .describe(
-    `Maximum characters kept from each long text field (default ${TEXT_LIMITS.lyrics}); ` +
-      'anything longer is cut and the result says how much was dropped.',
+    `Maximum characters kept from each long text field (default ${TEXT_LIMITS.lyrics}, ` +
+      `max ${MAX_TEXT_FIELD_CHARS}); anything longer is cut and the result says what was dropped.`,
   )
 
 const commentType = z
@@ -255,16 +290,63 @@ async function defaultRun(def: ToolDef, args: any, runtime: ToolRuntime): Promis
   }
 
   const paged = pageResultBody(def, result.body, args)
+  const ceiling = toolCeiling(def)
   if (def.render) {
-    const text = def.render(paged.body, args)
-    return { content: [{ type: 'text', text: `${text}${pagingFooter(paged.groups)}` }] }
+    let current = paged
+    let text = `${def.render(current.body, args)}${pagingFooter(current.groups)}`
+    // A rendered page can exceed the ceiling even when its paging footer fits. Rather
+    // than cutting the text, shrink the page: render fewer items and let the footer
+    // report exactly what was delivered, so the numbers stay true.
+    for (let attempt = 0; attempt < 8 && text.length > ceiling && current.groups.length > 0; attempt += 1) {
+      const shrunk = shrinkPage(current, text.length / ceiling)
+      if (!shrunk) break
+      current = shrunk
+      text = `${def.render(current.body, args)}${pagingFooter(current.groups)}`
+    }
+    return { content: [{ type: 'text', text }] }
   }
-  // Keep the paging object in view even when a verbose payload hits the ceiling.
-  const text = toToolTextKeepingTail(
-    capTextFields(trimGeneric(paged.body), TEXT_LIMITS.field),
-    TEXT_LIMITS.result,
-  )
+  // Keep the paging object in view even when a verbose payload has to be shortened.
+  // Structural truncation already corrects `paging.returned`/`hasMore` on the body it
+  // emits, so the numbers always describe what the caller actually received.
+  const { body: trimmed, notes } = trimGenericWithNotes(paged.body)
+  const text = toStructuredText(capTextFields(trimmed, TEXT_LIMITS.field), {
+    limit: ceiling,
+    notes,
+  })
   return { content: [{ type: 'text', text }] }
+}
+
+/**
+ * Drop items from the tail of every paged array until the page is roughly
+ * `1/ratio` of its current size, recording what was dropped on the page metadata.
+ * Returns undefined when nothing can be shrunk further.
+ */
+function shrinkPage(paged: { body: any; groups: PagedGroup[] }, ratio: number): { body: any; groups: PagedGroup[] } | undefined {
+  const factor = Math.min(0.95, Math.max(0.1, 1 / Math.max(1.05, ratio)))
+  let changed = false
+  let body = paged.body
+  const groups = paged.groups.map((group) => {
+    const path = group.path.split('.')
+    let cursor = body
+    for (const key of path.slice(0, -1)) {
+      cursor = cursor?.[key]
+      if (!cursor || typeof cursor !== 'object') return group
+    }
+    const list = cursor?.[path[path.length - 1]]
+    if (!Array.isArray(list) || list.length === 0) return group
+    const keep = Math.max(1, Math.floor(list.length * factor))
+    if (keep >= list.length) return group
+    const next = list.slice(0, keep)
+    cursor[path[path.length - 1]] = next
+    body = { ...body }
+    changed = true
+    const dropped = (group.meta.truncated ?? 0) + (list.length - keep)
+    return {
+      ...group,
+      meta: { ...group.meta, returned: keep, truncated: dropped, hasMore: true },
+    }
+  })
+  return changed ? { body, groups } : undefined
 }
 export async function runTool(
   def: ToolDef,
@@ -285,13 +367,37 @@ export async function runTool(
     }
   }
   try {
-    return def.run ? await def.run(args, runtime) : await defaultRun(def, args, runtime)
+    const result = def.run ? await def.run(args, runtime) : await defaultRun(def, args, runtime)
+    // Every result leaves through here, so this is the one place a hard ceiling can
+    // be enforced for both the rendered and the JSON paths.
+    return applyCeiling(def, result)
   } catch (error) {
     return {
       isError: true,
       content: [{ type: 'text', text: `Tool failed: ${(error as Error).message}` }],
     }
   }
+}
+
+/** Enforce the tool's ceiling on every text part, structurally. */
+function applyCeiling(def: ToolDef, result: ToolResult): ToolResult {
+  const limit = toolCeiling(def)
+  const content = result.content.map((part) =>
+    part.text.length <= limit
+      ? part
+      : { type: 'text' as const, text: enforceCeiling(part.text, { limit }) },
+  )
+  return { ...result, content }
+}
+
+/**
+ * JSON text for a tool result: generic trim, per-field cap, then a structural
+ * truncation that keeps the document parseable. Handlers use this instead of
+ * `JSON.stringify`, so every JSON result is bounded the same way.
+ */
+function renderJsonResult(body: any, fieldLimit: number = TEXT_LIMITS.field, ceiling: number = TEXT_LIMITS.result): string {
+  const { body: trimmed, notes } = trimGenericWithNotes(body)
+  return toStructuredText(capTextFields(trimmed, fieldLimit), { limit: ceiling, notes })
 }
 
 function songLine(song: any): string {
@@ -437,7 +543,7 @@ const accountTools: ToolDef[] = [
     }),
     annotations: READ_ONLY,
     endpoint: 'user_follows',
-    paging: { mode: 'offset', groups: [{ path: 'follow', label: 'users' }] },
+    paging: { mode: 'offset', groups: [{ path: 'follow', label: 'users', hasMorePath: 'more' }] },
     render: (body) => renderUserList(body?.follow ?? [], 'Following'),
   },
   {
@@ -662,7 +768,7 @@ const searchTools: ToolDef[] = [
       delete rest.realkeyword
       delete rest.searchType
       const tail = Object.keys(rest).length
-        ? `\n${toToolText(capTextFields(trimGeneric(rest), TEXT_LIMITS.field), TEXT_LIMITS.result)}`
+        ? `\n${renderJsonResult(rest, TEXT_LIMITS.field)}`
         : ''
       return `${lines.join('\n')}${tail}`
     },
@@ -934,7 +1040,10 @@ const discoverTools: ToolDef[] = [
     }),
     annotations: READ_ONLY,
     endpoint: 'top_playlist',
-    paging: { mode: 'offset', groups: [{ path: 'playlists', label: 'playlists' }] },
+    paging: {
+      mode: 'offset',
+      groups: [{ path: 'playlists', label: 'playlists', hasMorePath: 'more', totalPath: 'total' }],
+    },
   },
   {
     name: 'ncm_top_artists',
@@ -942,11 +1051,12 @@ const discoverTools: ToolDef[] = [
     title: 'Top artists',
     description:
       'Most popular artists on the platform. ' +
-      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}).`,
+      `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}); ` +
+      'the footer reports the upstream hasMore flag.',
     input: z.object({ ...paging }),
     annotations: READ_ONLY,
     endpoint: 'top_artists',
-    paging: { mode: 'offset', groups: [{ path: 'artists', label: 'artists' }] },
+    paging: { mode: 'offset', groups: [{ path: 'artists', label: 'artists', hasMorePath: 'more' }] },
   },
   {
     name: 'ncm_music_calendar',
@@ -967,17 +1077,31 @@ const discoverTools: ToolDef[] = [
       const days = Object.entries(body?.data ?? {}) as [string, any][]
       if (!days.length) return '(nothing released in range)'
       const { items, meta } = paginate(days, args)
-      const group = { label: 'days', path: 'data', unit: 'days', meta }
-      const text = items
-        .map(
-          ([day, payload]) =>
-            `${day}\n${(payload?.newAlbums ?? [])
-              .slice(0, 20)
-              .map((a: any) => `  · ${a.name} — ${a.artist?.name ?? ''} id=${a.id}`)
-              .join('\n')}`,
-        )
-        .join('\n')
-      return `${text}${pagingFooter([group])}`
+      const group: PagedGroup = { label: 'days', path: 'data', unit: 'days', meta }
+      const dayBlocks = items.map(
+        ([day, payload]) =>
+          `${day}\n${(payload?.newAlbums ?? [])
+            .slice(0, 20)
+            .map((a: any) => `  · ${a.name} — ${a.artist?.name ?? ''} id=${a.id}`)
+            .join('\n')}`,
+      )
+      // Day blocks are variable-length, so the ceiling is applied per day: a day that
+      // does not fit ends the page and says so, rather than being cut mid-line. The
+      // footer then reports the days actually delivered, not the ones rendered.
+      const cut = truncateLines(dayBlocks, {
+        limit: TEXT_LIMITS.result,
+        unit: 'days',
+        hint: () => 'narrow the date range or use a smaller pageSize',
+      })
+      const delivered = cut.kept
+      const adjusted: PagedGroup =
+        delivered < items.length
+          ? {
+              ...group,
+              meta: { ...meta, returned: delivered, truncated: items.length - delivered, hasMore: true },
+            }
+          : group
+      return `${cut.text}${pagingFooter([adjusted])}`
     },
   },
 ]
@@ -1088,22 +1212,22 @@ const musicTools: ToolDef[] = [
     toolset: 'music',
     title: 'Lyrics',
     description:
-      'Plain and translated lyrics plus the optional LRC timestamped version. Each block is capped at ' +
-      `maxChars characters (default ${TEXT_LIMITS.lyrics}) and says how much was cut, so one call cannot ` +
-      'flood the context; raise maxChars when you need the whole song.',
+      'Plain and translated lyrics plus the optional LRC timestamped version. The whole result is ' +
+      `capped at ${TEXT_LIMITS.result} characters and each block at maxChars (default ${TEXT_LIMITS.lyrics}, ` +
+      `max ${MAX_TEXT_FIELD_CHARS}); whatever is cut is named in a trailing notice.`,
     input: z.object({
       id: z.union([z.string(), z.number()]),
       includeLrc: z.boolean().optional().describe('Include raw LRC with timestamps'),
       includeTranslation: z.boolean().optional().describe('Include the translated lyrics'),
       maxChars: maxChars.describe(
-        `Maximum characters kept from each lyrics block (default ${TEXT_LIMITS.lyrics}); ` +
-          'blocks longer than this are cut and marked truncated.',
+        `Maximum characters kept from each lyrics block (default ${TEXT_LIMITS.lyrics}, ` +
+          `max ${MAX_TEXT_FIELD_CHARS}); blocks longer than this are cut and marked truncated.`,
       ),
     }),
     annotations: READ_ONLY,
     endpoint: 'lyric',
     render: (body, args) => {
-      const limit = typeof args.maxChars === 'number' && args.maxChars > 0 ? Math.trunc(args.maxChars) : TEXT_LIMITS.lyrics
+      const limit = clampTextLimit(args.maxChars, TEXT_LIMITS.lyrics)
       const parts: string[] = []
       if (body?.lrc?.lyric) {
         const raw = args.includeLrc ? body.lrc.lyric : stripLrcTimestamps(body.lrc.lyric)
@@ -1116,7 +1240,14 @@ const musicTools: ToolDef[] = [
         parts.push(`--- romanised ---\n${capText(stripLrcTimestamps(body.romalrc.lyric), limit)}`)
       }
       if (body?.nolyric) parts.push('(instrumental, no lyrics)')
-      return parts.join('\n\n') || '(no lyrics available)'
+      const text = parts.join('\n\n') || '(no lyrics available)'
+      // Three blocks at maxChars each could still overflow the tool ceiling, and the
+      // global ceiling would cut without saying which block gave way.
+      return truncateText(text, {
+        limit: TEXT_LIMITS.result,
+        unit: 'lines',
+        hint: () => `each block was capped at maxChars=${limit}; lower it or set includeTranslation=false`,
+      })
     },
   },
   {
@@ -1125,7 +1256,8 @@ const musicTools: ToolDef[] = [
     title: 'Lyric highlights',
     description:
       'Curated "lyric marks" (highlighted lines) for a song. Long fields are capped at ' +
-      `maxChars characters (default ${TEXT_LIMITS.lyricMark}) and marked when truncated.`,
+      `maxChars characters (default ${TEXT_LIMITS.lyricMark}, max ${MAX_TEXT_FIELD_CHARS}), the whole ` +
+      `result at ${TEXT_LIMITS.result}, and both are marked when truncated.`,
     input: z.object({
       id: z.union([z.string(), z.number()]),
       maxChars: maxChars.describe(
@@ -1134,11 +1266,7 @@ const musicTools: ToolDef[] = [
     }),
     annotations: READ_ONLY,
     endpoint: 'song_lyrics_mark',
-    render: (body, args) => {
-      const limit =
-        typeof args.maxChars === 'number' && args.maxChars > 0 ? Math.trunc(args.maxChars) : TEXT_LIMITS.lyricMark
-      return toToolText(capTextFields(trimGeneric(body), limit), TEXT_LIMITS.result)
-    },
+    render: (body, args) => renderJsonResult(body, clampTextLimit(args.maxChars, TEXT_LIMITS.lyricMark)),
   },
   {
     name: 'ncm_similar_songs',
@@ -1162,15 +1290,12 @@ const musicTools: ToolDef[] = [
     title: 'Song credits',
     description:
       'Songwriters, composers and producers for a song. Long fields are capped at ' +
-      `maxChars characters (default ${TEXT_LIMITS.field}).`,
+      `maxChars characters (default ${TEXT_LIMITS.field}, max ${MAX_TEXT_FIELD_CHARS}) and the whole ` +
+      `result at ${TEXT_LIMITS.result}.`,
     input: z.object({ id: z.union([z.string(), z.number()]), maxChars }),
     annotations: READ_ONLY,
     endpoint: 'song_creators',
-    render: (body, args) => {
-      const limit =
-        typeof args.maxChars === 'number' && args.maxChars > 0 ? Math.trunc(args.maxChars) : TEXT_LIMITS.field
-      return toToolText(capTextFields(trimGeneric(body), limit), TEXT_LIMITS.result)
-    },
+    render: (body, args) => renderJsonResult(body, clampTextLimit(args.maxChars, TEXT_LIMITS.field)),
   },
   {
     name: 'ncm_check_music',
@@ -1232,17 +1357,12 @@ const musicTools: ToolDef[] = [
     title: 'Artist detail',
     description:
       'Artist bio, aliases, follower counts and hot songs. The bio is capped at ' +
-      `maxChars characters (default ${TEXT_LIMITS.description}) and marked when truncated.`,
+      `maxChars characters (default ${TEXT_LIMITS.description}, max ${MAX_TEXT_FIELD_CHARS}), the whole ` +
+      `result at ${TEXT_LIMITS.result}, and both are marked when truncated.`,
     input: z.object({ id: z.union([z.string(), z.number()]), maxChars }),
     annotations: READ_ONLY,
     endpoint: 'artist_detail',
-    render: (body, args) => {
-      const limit =
-        typeof args.maxChars === 'number' && args.maxChars > 0
-          ? Math.trunc(args.maxChars)
-          : TEXT_LIMITS.description
-      return toToolText(capTextFields(trimGeneric(body), limit), TEXT_LIMITS.result)
-    },
+    render: (body, args) => renderJsonResult(body, clampTextLimit(args.maxChars, TEXT_LIMITS.description)),
   },
   {
     name: 'ncm_artist_songs',
@@ -1271,7 +1391,7 @@ const musicTools: ToolDef[] = [
     input: z.object({ id: z.union([z.string(), z.number()]), ...paging }),
     annotations: READ_ONLY,
     endpoint: 'artist_album',
-    paging: { mode: 'offset', groups: [{ path: 'hotAlbums', label: 'albums' }] },
+    paging: { mode: 'offset', groups: [{ path: 'hotAlbums', label: 'albums', hasMorePath: 'more' }] },
     render: (body) =>
       (body?.hotAlbums ?? [])
         .map((a: any) => `- ${a.name} (${a.size ?? '?'} tracks) id=${a.id}`)
@@ -1689,6 +1809,46 @@ const libraryTools: ToolDef[] = [
 // comments
 // ---------------------------------------------------------------------------
 
+/**
+ * A comment page as text. Comment bodies vary widely in length, so the ceiling is
+ * applied per comment: whole comments are dropped from the end and the paging footer
+ * reports what was actually delivered.
+ */
+function renderCommentPage(comments: any[], meta: PageMeta, total?: number): string {
+  const unit = 'comments'
+  const group: PagedGroup = { label: unit, path: 'comments', unit, meta }
+  const header = `${total ?? 'unknown'} comments in total`
+  if (comments.length === 0) return `${header}\n${pagingEmptyNote(meta, unit)}${pagingFooter([group])}`
+  const lines = comments.map(
+    (c: any) =>
+      `[${c.likedCount ?? 0} likes] ${c.user?.nickname ?? 'anon'}: ${c.content}${
+        c.replies?.length ? `\n    ↳ ${c.replies.length} replies` : ''
+      }`,
+  )
+  const cut = truncateLines(lines, {
+    limit: TEXT_LIMITS.result - header.length - 2,
+    unit,
+    // Items dropped from the tail are missing from *this* page, so re-reading must
+    // start at the page whose window begins at or before this offset.
+    hint: (record) => {
+      const keep = Math.max(1, record.kept)
+      const restart = Math.floor(meta.offset / keep) + 1
+      return `re-request with pageSize<=${keep} and page=${restart} to read these ${unit}`
+    },
+  })
+  const adjusted: PagedGroup =
+    cut.kept < comments.length
+      ? {
+          ...group,
+          meta: { ...meta, returned: cut.kept, truncated: comments.length - cut.kept, hasMore: true },
+        }
+      : group
+  return `${header}\n${cut.text}${pagingFooter([adjusted])}`
+}
+
+// ---------------------------------------------------------------------------
+// comment tools
+
 const commentTools: ToolDef[] = [
   {
     name: 'ncm_comments',
@@ -1698,7 +1858,8 @@ const commentTools: ToolDef[] = [
       'Comments of a song, album, playlist, MV, radio programme or video. ' +
       `Paged: page (1-based, default 1) and pageSize (default ${DEFAULT_PAGE_SIZE}, max ${MAX_PAGE_SIZE}); ` +
       'the footer reports the upstream total and hasMore. Comment bodies are capped at ' +
-      `${TEXT_LIMITS.description} characters.`,
+      `${TEXT_LIMITS.description} characters and the whole result at ${TEXT_LIMITS.result}; a page ` +
+      'that would exceed it drops whole comments from the end and says how many.',
     input: z.object({
       type: commentType,
       id: z.union([z.string(), z.number()]),
@@ -1730,18 +1891,14 @@ const commentTools: ToolDef[] = [
       const total = typeof result.body?.total === 'number' ? result.body.total : undefined
       const more = typeof result.body?.more === 'boolean' ? result.body.more : undefined
       const meta = pageMeta(pageRequest(args), comments.length, { total, hasMore: more })
-      const group: PagedGroup = { label: 'comments', path: 'comments', unit: 'comments', meta }
-      const header = `${total ?? 'unknown'} comments in total`
-      const body = comments
-        .map(
-          (c: any) =>
-            `[${c.likedCount} likes] ${c.user?.nickname ?? 'anon'}: ${c.content}${
-              c.replies?.length ? `\n    ↳ ${c.replies.length} replies` : ''
-            }`,
-        )
-        .join('\n')
-      const text = body || pagingEmptyNote(meta, 'comments')
-      return { content: [{ type: 'text', text: `${header}\n${text}${pagingFooter([group])}` }] }
+      return {
+        content: [
+          {
+            type: 'text',
+            text: renderCommentPage(comments, meta, total),
+          },
+        ],
+      }
     },
   },
   {
@@ -2145,16 +2302,41 @@ const metaTools: ToolDef[] = [
       'registration, captcha) or spend money (gifting, paid charts, coin spend, digital albums) ' +
       'are blocked outright and are not listed by ncm_list_endpoints. The payload is ' +
       `capped at ${TEXT_LIMITS.raw} characters and long text fields at maxChars (default ` +
-      `${TEXT_LIMITS.field}); the result says when anything was cut. For offset-capable endpoints ` +
-      'pass limit/offset in params yourself.',
+      `${TEXT_LIMITS.field}, max ${MAX_TEXT_FIELD_CHARS}); the result names any field it shortened. ` +
+      'limit and offset are forwarded to the endpoint as real parameters and take precedence over ' +
+      'the same keys inside params, so an offset-capable endpoint pages upstream instead of locally. ' +
+      'Note that many NetEase endpoints answer with limit+1 rows to report their own "more" flag; ' +
+      'that extra row is the endpoint’s signal, not part of your requested window.',
     input: z.object({
       endpoint: z.string().min(1).describe('Endpoint name, from ncm_list_endpoints'),
-      params: z.record(z.string(), z.any()).optional().describe('Parameters passed straight through'),
+      params: z
+        .record(z.string(), z.any())
+        .optional()
+        .describe('Parameters passed straight through; limit/offset here are kept unless set on the input'),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_PAGE_SIZE)
+        .optional()
+        .describe(
+          `Rows to ask the endpoint for (1..${MAX_PAGE_SIZE}). Forwarded upstream as \`limit\`; ` +
+            'endpoints that over-deliver may return one extra row for their own "more" flag.',
+        ),
+      offset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe('Rows to skip. Forwarded upstream as `offset`; needs an endpoint that honours it.'),
       maxChars: maxChars.describe(
-        `Maximum characters kept from each long text field (default ${TEXT_LIMITS.field}).`,
+        `Maximum characters kept from each long text field (default ${TEXT_LIMITS.field}, ` +
+          `max ${MAX_TEXT_FIELD_CHARS}).`,
       ),
     }),
     annotations: { readOnlyHint: false, openWorldHint: true },
+    // The escape hatch is allowed the larger ceiling; everything else stays at 12000.
+    maxTextChars: TEXT_LIMITS.raw,
     run: async (args, runtime) => {
       const { hasEndpoint } = await import('@/lib/ncm/modules')
       if (!hasEndpoint(args.endpoint)) {
@@ -2193,13 +2375,41 @@ const metaTools: ToolDef[] = [
           ],
         }
       }
-      const limit =
-        typeof args.maxChars === 'number' && args.maxChars > 0 ? Math.trunc(args.maxChars) : TEXT_LIMITS.field
-      const result = await callNcm(args.endpoint, args.params ?? {}, {
+      const fieldLimit = clampTextLimit(args.maxChars, TEXT_LIMITS.field)
+      // `limit`/`offset` are real inputs now, so they reach the endpoint instead of
+      // being stripped by the schema. A top-level value wins over the same key inside
+      // `params`; `params` on its own keeps working exactly as before.
+      const upstream: Record<string, unknown> = { ...(args.params ?? {}) }
+      if (args.limit !== undefined) upstream.limit = args.limit
+      if (args.offset !== undefined) upstream.offset = args.offset
+      const result = await callNcm(args.endpoint, upstream, {
         jar: runtime.jar,
         fakeIp: runtime.fakeIp,
       })
-      const text = toToolText(capTextFields(trimGeneric(result.body), limit), TEXT_LIMITS.raw)
+      // Echo the window that actually went upstream, plus the endpoint's own "more"
+      // flag when it sends one, so a caller can tell the params were honoured.
+      const sentLimit = typeof upstream.limit === 'number' ? upstream.limit : undefined
+      const sentOffset = typeof upstream.offset === 'number' ? upstream.offset : undefined
+      const body = result.body
+      let payload = body
+      if (
+        body &&
+        typeof body === 'object' &&
+        !Array.isArray(body) &&
+        (sentLimit !== undefined || sentOffset !== undefined)
+      ) {
+        payload = {
+          ...body,
+          request: {
+            ...(sentLimit !== undefined ? { limit: sentLimit } : {}),
+            ...(sentOffset !== undefined ? { offset: sentOffset } : {}),
+            ...(typeof body.more === 'boolean' ? { hasMore: body.more } : {}),
+            ...(typeof body.total === 'number' ? { total: body.total } : {}),
+            note: 'window sent upstream as limit/offset; some endpoints answer with limit+1 rows for their own more flag',
+          },
+        }
+      }
+      const text = renderJsonResult(payload, fieldLimit, TEXT_LIMITS.raw)
       return { content: [{ type: 'text', text }], isError: !result.ok }
     },
   },
