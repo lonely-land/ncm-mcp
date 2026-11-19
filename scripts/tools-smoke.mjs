@@ -117,9 +117,12 @@ const PAGING_PROBES = [
  * "pass" on a normal-sized sample would hide the defect.
  */
 const STRESS_CALLS = [
-  // Unbounded maxChars was accepted and produced 240k characters.
-  { name: 'ncm_lyric', args: { id: 347230, maxChars: 80000, includeLrc: true } },
+  // The unbounded maxChars that used to produce 240k characters. The schema now
+  // rejects it, so the expectation is a validation error, not a huge result.
+  { name: 'ncm_lyric', args: { id: 347230, maxChars: 80000, includeLrc: true }, expectReject: /maxChars/ },
+  // The largest maxChars the schema still allows.
   { name: 'ncm_lyric', args: { id: 347230, maxChars: 5000, includeLrc: true } },
+  { name: 'ncm_lyric_mark', args: { id: 347230, maxChars: 5000 } },
   { name: 'ncm_comment_hot', args: { id: 347230, pageSize: 100 } },
   { name: 'ncm_comments', args: { type: 'song', id: 347230, pageSize: 100 } },
   { name: 'ncm_top_playlists', args: { pageSize: 100 } },
@@ -130,6 +133,8 @@ const STRESS_CALLS = [
   { name: 'ncm_raw', args: { endpoint: 'user_playlist', params: { uid: 32953014 } } },
   { name: 'ncm_raw', args: { endpoint: 'user_playlist', params: { uid: 32953014 }, limit: 3 } },
   { name: 'ncm_raw', args: { endpoint: 'top_playlist', limit: 50, offset: 0, maxChars: 5000 } },
+  // Over-max `limit` must be refused, not silently clamped by the endpoint.
+  { name: 'ncm_raw', args: { endpoint: 'user_playlist', limit: 5000 }, expectReject: /limit/ },
 ]
 
 /**
@@ -411,6 +416,29 @@ async function main() {
   for (const call of STRESS_CALLS) {
     if (!tools.some((tool) => tool.name === call.name)) continue
     const result = await callTool(call.name, call.args)
+    // A deliberately out-of-range argument must be refused by the schema, naming the
+    // field — that is the bound doing its job, not an upstream or transport failure.
+    if (call.expectReject) {
+      const rejected =
+        result.isError && call.expectReject.test(result.text) && /validation error|invalid/i.test(result.text)
+      if (!rejected) {
+        failures += 1
+        stressChecks.push({
+          name: call.name,
+          args: call.args,
+          verdict: 'FAIL',
+          detail: `expected a validation error naming ${call.expectReject}, got: ${result.text.slice(0, 90)}`,
+        })
+        continue
+      }
+      stressChecks.push({
+        name: call.name,
+        args: call.args,
+        verdict: 'ok',
+        detail: `rejected as out of range: ${result.text.slice(0, 80)}`,
+      })
+      continue
+    }
     if (result.isError) {
       stressChecks.push({ name: call.name, args: call.args, verdict: 'skip', detail: 'upstream gate' })
       continue

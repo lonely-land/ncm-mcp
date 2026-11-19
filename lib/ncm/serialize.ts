@@ -834,10 +834,38 @@ export function toStructuredText(body: Json, options: TruncationOptions): string
   return trimJsonToLimit(parsed, options).text
 }
 
+/** Matches the "items 1-20 of 680" range in a paging footer. */
+const FOOTER_RANGE = /items (\d+)-(\d+) of (\d+)/
+
+/**
+ * Rewrite a paging footer after items were dropped from the body, so it describes what
+ * was actually delivered. A truncated page still starts at the same offset, so the range
+ * shrinks, the count drops to the delivered number, and `hasMore` becomes true.
+ */
+export function adjustFooterForDrops(footer: string, delivered: number, dropped: number): string {
+  if (!footer || dropped <= 0) return footer
+  return footer
+    .split('\n')
+    .map((line) => {
+      const range = FOOTER_RANGE.exec(line)
+      let out = line
+      if (range) {
+        const start = Number(range[1])
+        const end = start - 1 + delivered
+        out = out.replace(FOOTER_RANGE, `items ${start}-${end} of ${range[3]}`)
+      }
+      out = out.replace(/· (\d+) ([a-zA-Z]+) ·/, (_match, _count, noun) => `· ${delivered} ${noun} ·`)
+      if (!/hasMore=/.test(out)) return out
+      return out.replace(/hasMore=\w+/, 'hasMore=true').replace(/ · next: page=\d+/, '')
+    })
+    .join('\n')
+}
+
 /**
  * Last line of defence, applied to every tool result whatever produced it. Returns
  * the text unchanged when it fits, otherwise re-truncates structurally — JSON stays
- * parseable, plain text keeps whole lines — and preserves the paging footer.
+ * parseable, plain text keeps whole lines — and preserves the paging footer, corrected
+ * to the number of items that actually made it into the result.
  */
 export function enforceCeiling(text: string, options: TruncationOptions): string {
   if (typeof text !== 'string') return ''
@@ -854,5 +882,9 @@ export function enforceCeiling(text: string, options: TruncationOptions): string
       // Not JSON after all; fall through to the line path.
     }
   }
-  return truncateText(body, { ...options, limit: budget, keepTail: footer || undefined })
+  const kept = truncateTextDetailed(body, { ...options, limit: budget })
+  const delivered = kept.kept
+  const rewritten = footer ? adjustFooterForDrops(footer, delivered, kept.dropped) : ''
+  return rewritten ? `${kept.text}\n\n${rewritten}` : kept.text
 }
+
