@@ -91,6 +91,24 @@ export function upstreamWindow(req: PageRequest): { limit: number; offset: numbe
 }
 
 /**
+ * Clamp an upstream array to the window that was actually asked for.
+ *
+ * Several NetEase endpoints answer `limit` with `limit + 1` rows so they can set their
+ * own `more` flag. That extra row is the endpoint's signal, not part of the page: it
+ * must not inflate `returned` (which would make page N overlap page N+1) and it is
+ * itself proof that more exists.
+ */
+export function takeWindow<T>(
+  list: readonly T[],
+  requestedLimit: number | undefined,
+): { items: T[]; overDelivered: boolean } {
+  if (requestedLimit === undefined || list.length <= requestedLimit) {
+    return { items: [...list], overDelivered: false }
+  }
+  return { items: list.slice(0, requestedLimit), overDelivered: true }
+}
+
+/**
  * For endpoints that take `limit` but no `offset`: ask for everything up to the end
  * of the requested page so the page can be sliced locally. Capped by MAX_FETCH so a
  * deep page cannot drag thousands of rows through one call.
@@ -112,25 +130,40 @@ export function knownTotal(list: readonly unknown[] | undefined, fetchLimit?: nu
 /**
  * Describe one page.
  *
- * `total` is only ever reported when someone actually knows it: the upstream sent a
- * count, or the caller holds the complete list. A short page proves the end of a
- * collection, so it is used as a `hasMore` signal — never as a total, because an
- * endpoint with its own cap (e.g. 29 rows whatever `limit` asks) would otherwise
- * report "of 29" for a feed that really holds 47.
+ * `hasMore === false` means this page ends the collection, so everything up to and
+ * including it is the whole collection and `offset + returned` is an exact total —
+ * not a guess. A finished collection that reported "total unknown" made callers think
+ * rows were missing, so the total is derived from the page itself in that case.
+ *
+ * The derived total is exactly as trustworthy as `hasMore`: when the upstream says the
+ * collection ends, or a short page implies it and no flag contradicts it, the derived
+ * number is the collection's size. An endpoint that caps a page below the requested
+ * `limit` without saying so would also be reporting a false `hasMore` — that is a
+ * different bug, and it is the `hasMore` that has to be fixed, not the arithmetic here.
+ *
+ * Two things are deliberately not done:
+ * - no total is invented while `hasMore` is true: the collection continues and its
+ *   size is genuinely unknown unless the upstream sent a count;
+ * - an empty page beyond the first says nothing about the size (only that it is below
+ *   `offset`), so it reports no total rather than handing back the offset.
  */
 export function pageMeta(
   req: PageRequest,
   returned: number,
   options: { total?: number; hasMore?: boolean } = {},
 ): PageMeta {
-  const total =
+  const declared =
     typeof options.total === 'number' && Number.isFinite(options.total) ? options.total : undefined
   const hasMore =
     typeof options.hasMore === 'boolean'
       ? options.hasMore
-      : total !== undefined
-        ? req.offset + returned < total
+      : declared !== undefined
+        ? req.offset + returned < declared
         : returned > 0 && returned >= req.pageSize
+  // A page at offset 0 with nothing on it is an empty collection, and 0 is exact.
+  const derived =
+    !hasMore && (returned > 0 || req.offset === 0) ? req.offset + returned : undefined
+  const total = declared ?? derived
   return {
     page: req.page,
     pageSize: req.pageSize,
@@ -183,6 +216,11 @@ export function pagingLine(meta: PageMeta, unit = 'items'): string {
     } else {
       parts.push(`${meta.total} ${unit} available in total`)
     }
+  } else if (!meta.hasMore && meta.offset > 0) {
+    // Nothing on this page and nothing after it: the collection ended at or before
+    // this offset. Its exact size is unknown, but it is at most `offset` — say that
+    // instead of pretending the offset is the total.
+    parts.push(`past the end (collection ended at or before offset ${meta.offset})`)
   } else {
     parts.push('total unknown')
   }
@@ -203,8 +241,10 @@ export function pagingLine(meta: PageMeta, unit = 'items'): string {
 /** Empty-page note so a caller past the end sees why nothing came back. */
 export function pagingEmptyNote(meta: PageMeta, unit = 'items'): string {
   if (meta.page <= 1) return `(no ${unit})`
-  const total = meta.total !== undefined ? `; ${meta.total} ${unit} available` : ''
-  return `(no ${unit} on page ${meta.page}${total})`
+  if (meta.total !== undefined) return `(no ${unit} on page ${meta.page}; ${meta.total} ${unit} available)`
+  // Past the end of a collection whose size was never counted: the page itself says
+  // nothing about how many rows exist, only that they all fit before this offset.
+  return `(no ${unit} on page ${meta.page}; at most ${meta.offset} in total)`
 }
 
 /** Trailer appended to a rendered tool result so the model sees the paging state. */
@@ -340,11 +380,13 @@ function firstFiniteNumber(body: any, paths: string[]): number | undefined {
  *             end), so slice locally; a short response means the collection ended
  * - `local`:  upstream sent everything, so slice locally and the list is complete
  *
- * `total` is only reported when a real count is available (the tool's `totalPath`,
- * a conventional counter, or a complete local list). `hasMore` prefers the upstream
- * flag — the tool's `hasMorePath`, a conventional `more`/`hasMore` key, or the
- * `limit+1` over-delivery an endpoint uses to signal more rows — and otherwise infers
- * from a short page, which can only ever turn `hasMore` off, never on.
+ * `total` is reported when a real count is available (the tool's `totalPath`, a
+ * conventional counter, or a complete local list) and, for a final page, derived from
+ * the page itself: `hasMore === false` proves `offset + returned` is the whole
+ * collection. `hasMore` prefers the upstream flag — the tool's `hasMorePath`, a
+ * conventional `more`/`hasMore` key, or the `limit+1` over-delivery an endpoint uses to
+ * signal more rows — and otherwise infers from a short page, which can only ever turn
+ * `hasMore` off, never on.
  */
 export function paginateGroups(
   body: any,
