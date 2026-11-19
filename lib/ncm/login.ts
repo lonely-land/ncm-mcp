@@ -35,6 +35,11 @@ function successOutcome(body: any, jar: CookieJar): LoginOutcome {
     ok: true,
     message: 'Signed in',
     jar,
+    // Best effort only: the QR (`803`) and some password bodies carry no `account`/`profile`,
+    // and the uid captured here is sealed into the JWE for its whole life, so a token minted
+    // without one stays uid-less. That is fine now — the tool layer resolves the account from
+    // the cookie jar via `user_account` (see lib/ncm/account.ts) whenever the token has none.
+    // Deliberately no upstream identity call here: `/token` must not gain a round-trip.
     userId: body?.account?.id ?? body?.profile?.userId,
     nickname: body?.profile?.nickname,
     code: body?.code,

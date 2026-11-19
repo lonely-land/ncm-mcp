@@ -9,6 +9,7 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
+    "test": "node --test scripts/*.test.mjs",
     "e2e": "node scripts/oauth-e2e.mjs",
     "smoke": "node scripts/tools-smoke.mjs"
   },

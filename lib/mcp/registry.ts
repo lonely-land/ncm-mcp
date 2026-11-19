@@ -2,8 +2,10 @@ import type { ToolAnnotations } from '@modelcontextprotocol/server'
 import * as z from 'zod'
 
 import { blockedRawEndpoints } from '@/lib/config'
+import { resolveOwnUid } from '@/lib/ncm/account'
 import { callNcm } from '@/lib/ncm/client'
 import type { CookieJar } from '@/lib/ncm/cookies'
+import { UID_DIAGNOSTIC } from '@/lib/ncm/uid'
 import {
   TEXT_LIMITS,
   capText,
@@ -73,6 +75,12 @@ export interface ToolDef {
   paging?: ToolPaging
   requiresWrite?: boolean
   requiresLogin?: boolean
+  /**
+   * Injects the session's own account id as `uid` before the call, resolving it via
+   * the token and then the cookie jar. Only for endpoints that require a uid param
+   * (likelist, user_binding); the rest read identity from the cookie upstream.
+   */
+  ownUidParam?: boolean
 }
 
 export type ToolsetName =
@@ -196,6 +204,13 @@ const SEARCH_TYPE_CODE: Record<string, number> = {
 async function defaultRun(def: ToolDef, args: any, runtime: ToolRuntime): Promise<ToolResult> {
   const mapped = def.mapArgs ? def.mapArgs(args, runtime) : { ...args }
   const params = { ...stripPagingArgs(mapped), ...upstreamParams(def, args) }
+
+  if (def.ownUidParam && params.uid === undefined) {
+    const own = await resolveOwnUid(runtime)
+    if (!own.ok) return { isError: true, content: [{ type: 'text', text: own.message }] }
+    params.uid = own.uid
+  }
+
   const result = await callNcm(def.endpoint!, params, {
     jar: runtime.jar,
     fakeIp: runtime.fakeIp,
@@ -319,21 +334,52 @@ const accountTools: ToolDef[] = [
     input: z.object({}),
     annotations: READ_ONLY,
     endpoint: 'login_status',
-    render: (body) => {
-      const data = body?.data ?? body
-      if (!data?.account) {
-        return [
-          'Anonymous session: no NetEase account is linked to this connection.',
-          'Public read tools work. Anything personal (library, playlists, likes, writes) needs sign-in:',
-          'disconnect the server in your MCP client, reconnect, and use the login page that opens.',
+    run: async (_args, runtime) => {
+      const result = await callNcm('login_status', {}, { jar: runtime.jar, fakeIp: runtime.fakeIp })
+      const data = result.ok ? (result.body?.data ?? result.body) : undefined
+      if (data?.account) {
+        const text = [
+          `Logged in as ${data.profile?.nickname ?? '(unknown)'}`,
+          `userId: ${data.account.id}`,
+          `VIP type: ${data.account.vipType ?? 0}`,
+          `created: ${data.account.createTime ?? 'n/a'}`,
         ].join('\n')
+        return { content: [{ type: 'text', text }] }
       }
-      return [
-        `Logged in as ${data.profile?.nickname ?? '(unknown)'}`,
-        `userId: ${data.account.id}`,
-        `VIP type: ${data.account.vipType ?? 0}`,
-        `created: ${data.account.createTime ?? 'n/a'}`,
-      ].join('\n')
+
+      if (!runtime.jar.MUSIC_U) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: [
+                'Anonymous session: no NetEase account is linked to this connection.',
+                'Public read tools work. Anything personal (library, playlists, likes, writes) needs sign-in:',
+                'disconnect the server in your MCP client, reconnect, and use the login page that opens.',
+              ].join('\n'),
+            },
+          ],
+        }
+      }
+
+      // The jar carries a session cookie, so "anonymous" would be a lie: the upstream just
+      // did not identify the account. Ask the same resolver the own-uid tools use, so the
+      // message says which half of the session is missing.
+      const own = await resolveOwnUid(runtime)
+      const detail = own.ok
+        ? `The access token holds userId ${own.uid}, but upstream login_status returned no account for this cookie jar.`
+        : 'Neither the access token nor the upstream session exposed an account id.'
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text:
+              `A MUSIC_U session cookie is present, but the upstream session did not expose an account id. ${detail} ` +
+              UID_DIAGNOSTIC,
+          },
+        ],
+      }
     },
   },
   {
@@ -1389,6 +1435,7 @@ const libraryTools: ToolDef[] = [
     }),
     annotations: READ_ONLY,
     endpoint: 'likelist',
+    ownUidParam: true,
     requiresLogin: true,
     render: (body, args) => {
       const all: Array<number | string> = body?.ids ?? []
@@ -1443,16 +1490,13 @@ const libraryTools: ToolDef[] = [
     annotations: READ_ONLY,
     endpoint: 'user_playlist',
     run: async (args, runtime) => {
-      const uid = runtime.userId
-      if (!uid) {
-        return {
-          isError: true,
-          content: [{ type: 'text', text: 'No account id in this session; sign in again to refresh it.' }],
-        }
+      const own = await resolveOwnUid(runtime)
+      if (!own.ok) {
+        return { isError: true, content: [{ type: 'text', text: own.message }] }
       }
       const result = await callNcm(
         'user_playlist',
-        { uid, ...upstreamWindow(pageRequest(args)) },
+        { uid: own.uid, ...upstreamWindow(pageRequest(args)) },
         { jar: runtime.jar, fakeIp: runtime.fakeIp },
       )
       if (!result.ok) {
@@ -1626,6 +1670,7 @@ const libraryTools: ToolDef[] = [
     input: z.object({}),
     annotations: READ_ONLY,
     endpoint: 'user_binding',
+    ownUidParam: true,
     requiresLogin: true,
   },
   {
