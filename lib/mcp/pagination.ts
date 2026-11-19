@@ -47,9 +47,15 @@ export interface PageMeta {
   offset: number
   /** How many items this page actually carries. */
   returned: number
-  /** Total available, only when it is actually known. */
+  /** Total available, only when it is actually known. Never a guess. */
   total?: number
   hasMore: boolean
+  /**
+   * Items this page was measured to hold but the body ceiling removed from the end.
+   * The page is still the requested window; those items exist and are only missing
+   * from the text, so a caller re-reads the same page with a smaller pageSize.
+   */
+  truncated?: number
 }
 
 export interface PagedGroup {
@@ -103,6 +109,15 @@ export function knownTotal(list: readonly unknown[] | undefined, fetchLimit?: nu
   return list.length < fetchLimit ? list.length : undefined
 }
 
+/**
+ * Describe one page.
+ *
+ * `total` is only ever reported when someone actually knows it: the upstream sent a
+ * count, or the caller holds the complete list. A short page proves the end of a
+ * collection, so it is used as a `hasMore` signal — never as a total, because an
+ * endpoint with its own cap (e.g. 29 rows whatever `limit` asks) would otherwise
+ * report "of 29" for a feed that really holds 47.
+ */
 export function pageMeta(
   req: PageRequest,
   returned: number,
@@ -172,7 +187,16 @@ export function pagingLine(meta: PageMeta, unit = 'items'): string {
     parts.push('total unknown')
   }
   parts.push(`hasMore=${meta.hasMore}`)
-  if (meta.hasMore) parts.push(`next: page=${meta.page + 1}`)
+  if (meta.truncated && meta.returned > 0) {
+    // The window was the requested one but its tail did not fit. Point at a page
+    // whose window starts at or before this offset, so re-reading never skips items.
+    const smaller = meta.returned
+    const restartPage = Math.floor(meta.offset / smaller) + 1
+    parts.push(`${meta.truncated} dropped by the size ceiling`)
+    parts.push(`re-request with pageSize<=${smaller} and page=${restartPage} to read this range, then continue`)
+  } else if (meta.hasMore) {
+    parts.push(`next: page=${meta.page + 1}`)
+  }
   return parts.join(' · ')
 }
 
@@ -272,11 +296,39 @@ export type PagingMode = 'offset' | 'limit' | 'local'
 export interface PagingSpec {
   mode: PagingMode
   defaultPageSize?: number
+  /**
+   * The `limit` this call actually sent upstream. Some endpoints return `limit+1`
+   * rows so they can report `more`; that extra row is an over-delivery signal, not a
+   * page item, so it is trimmed before the page is measured.
+   */
+  requestedLimit?: number
 }
 
 export interface BodyPagingResult {
   body: any
   groups: PagedGroup[]
+  /** Set when an upstream `limit+1` over-delivery was trimmed off an array. */
+  trimmed?: { path: string; count: number }
+}
+
+/** Boolean "more exists" flags that endpoints put in different places. */
+const GENERIC_MORE_PATHS = ['more', 'hasMore', 'data.more', 'data.hasMore', 'result.more', 'result.hasMore']
+const GENERIC_TOTAL_PATHS = ['total', 'count', 'data.totalCount', 'data.total']
+
+function firstBoolean(body: any, paths: string[]): boolean | undefined {
+  for (const path of paths) {
+    const value = readPath(body, path)
+    if (typeof value === 'boolean') return value
+  }
+  return undefined
+}
+
+function firstFiniteNumber(body: any, paths: string[]): number | undefined {
+  for (const path of paths) {
+    const value = readPath(body, path)
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+  }
+  return undefined
 }
 
 /**
@@ -285,8 +337,14 @@ export interface BodyPagingResult {
  *
  * - `offset`: upstream applied limit/offset, so each array already holds the page
  * - `limit`:  upstream applied only limit (we asked for everything up to the page
- *             end), so slice locally and treat a short response as the true end
- * - `local`:  upstream sent everything, so slice locally and the total is exact
+ *             end), so slice locally; a short response means the collection ended
+ * - `local`:  upstream sent everything, so slice locally and the list is complete
+ *
+ * `total` is only reported when a real count is available (the tool's `totalPath`,
+ * a conventional counter, or a complete local list). `hasMore` prefers the upstream
+ * flag — the tool's `hasMorePath`, a conventional `more`/`hasMore` key, or the
+ * `limit+1` over-delivery an endpoint uses to signal more rows — and otherwise infers
+ * from a short page, which can only ever turn `hasMore` off, never on.
  */
 export function paginateGroups(
   body: any,
@@ -316,46 +374,85 @@ export function paginateGroups(
       const paging = Object.fromEntries(emptyGroups.map((group) => [group.path, { ...group.meta }]))
       return { body: { ...body, paging }, groups: emptyGroups }
     }
+    // An auto-detected array has no declared paths, so conventional flags still apply.
     effective = [{ path: detected, label: detected.split('.').pop() ?? detected }]
   }
 
   const req = pageRequest(args, spec.defaultPageSize)
   const fetchLimit = spec.mode === 'limit' ? localFetchLimit(req) : undefined
+  // Conventional flags only describe a single collection; with several groups each
+  // array needs its own declared path or an explicit count.
+  const single = effective.length === 1
+  const bodyHasMore = single ? firstBoolean(body, GENERIC_MORE_PATHS) : undefined
+  const bodyTotal = single ? firstFiniteNumber(body, GENERIC_TOTAL_PATHS) : undefined
   const groups: PagedGroup[] = []
   let patched: any = body
+  let trimmed: { path: string; count: number } | undefined
 
   for (const group of effective) {
     const path = splitPath(group.path)
-    const list = readPath(body, path)
-    if (!Array.isArray(list)) continue
+    const rawList = readPath(body, path)
+    if (!Array.isArray(rawList)) continue
+    let list: any[] = rawList
 
     const rawTotal = group.totalPath ? readPath(body, group.totalPath) : undefined
-    const reportedTotal = typeof rawTotal === 'number' && Number.isFinite(rawTotal) ? rawTotal : undefined
+    const declaredTotal = typeof rawTotal === 'number' && Number.isFinite(rawTotal) ? rawTotal : undefined
     const rawHasMore = group.hasMorePath ? readPath(body, group.hasMorePath) : undefined
-    const reportedHasMore = typeof rawHasMore === 'boolean' ? rawHasMore : undefined
+    const declaredHasMore = typeof rawHasMore === 'boolean' ? rawHasMore : undefined
+    const upstreamHasMore = declaredHasMore ?? bodyHasMore
+    const upstreamTotal = declaredTotal ?? bodyTotal
+
+    // A `limit+1` over-delivery means "there is at least one more row": the extra row
+    // is the signal, not a page item, so it never inflates `returned` or `hasMore`
+    // accounting, and never leaks into a page.
+    let overDelivered = false
+    if (spec.requestedLimit !== undefined && list.length > spec.requestedLimit) {
+      list = list.slice(0, spec.requestedLimit)
+      overDelivered = true
+      trimmed = { path: group.path, count: rawList.length - spec.requestedLimit }
+    }
 
     let items: any[]
     let meta: PageMeta
 
+    // A page that starts at or past a known total cannot hold anything. Some
+    // endpoints answer such an offset with an unrelated block of rows, which would
+    // otherwise be reported as page content.
+    const pastEnd = upstreamTotal !== undefined && req.offset >= upstreamTotal
+
     if (spec.mode === 'offset') {
       // The upstream already applied limit/offset: this array *is* the page.
-      items = list
-      meta = pageMeta(req, items.length, { total: reportedTotal, hasMore: reportedHasMore })
+      items = pastEnd ? [] : list
+      const reachedEnd = upstreamTotal !== undefined && req.offset + items.length >= upstreamTotal
+      meta = pageMeta(req, items.length, {
+        total: upstreamTotal,
+        hasMore: reachedEnd ? false : (upstreamHasMore ?? (overDelivered ? true : undefined)),
+      })
     } else {
-      // In both these modes the array starts at index 0; it is only complete when
-      // the upstream sent less than we asked for.
-      const complete = spec.mode === 'local' || list.length < (fetchLimit ?? 0)
-      const total = reportedTotal ?? (complete ? list.length : undefined)
-      items = list.slice(req.offset, req.offset + req.pageSize)
-      const inferredMore = complete ? req.offset + items.length < list.length : true
-      meta = pageMeta(req, items.length, { total, hasMore: reportedHasMore ?? inferredMore })
-      patched = writePath(patched, path, items)
+      // The array starts at index 0 in both local modes.
+      // - `local`: the upstream sent everything, so the list is complete and its
+      //   length is a real total.
+      // - `limit`: we asked for everything up to the page end; a short response
+      //   proves the end but says nothing about a total, so none is reported.
+      const complete = spec.mode === 'local' || (!overDelivered && list.length < (fetchLimit ?? 0))
+      items = pastEnd ? [] : list.slice(req.offset, req.offset + req.pageSize)
+      const inferredMore = complete
+        ? req.offset + items.length < list.length
+        : items.length >= req.pageSize
+      const reachedEnd = upstreamTotal !== undefined && req.offset + items.length >= upstreamTotal
+      meta = pageMeta(req, items.length, {
+        total: upstreamTotal ?? (spec.mode === 'local' ? list.length : undefined),
+        hasMore: reachedEnd ? false : (upstreamHasMore ?? (overDelivered ? true : inferredMore)),
+      })
     }
 
+    patched = writePath(patched, path, items)
     groups.push({ label: group.label, path: group.path, unit: group.unit ?? group.label, meta })
   }
 
   if (groups.length === 0) return { body, groups: [] }
   const paging = Object.fromEntries(groups.map((group) => [group.path, { ...group.meta }]))
-  return { body: { ...patched, paging }, groups }
+  const result: BodyPagingResult = { body: { ...patched, paging }, groups }
+  if (trimmed) result.trimmed = trimmed
+  return result
 }
