@@ -55,6 +55,49 @@ async function pkcePair() {
   return { verifier, challenge }
 }
 
+/**
+ * Mint one more access token through the real authorize → complete → token path, with a
+ * jar of the caller's choosing and no userId. Used to reproduce the uid-less token a QR
+ * login produces when the 803 body carries no `account`.
+ */
+async function mintTokenForJar(clientId, jarString) {
+  const { verifier, challenge } = await pkcePair()
+  const url = new URL(`${BASE}/authorize`)
+  url.searchParams.set('response_type', 'code')
+  url.searchParams.set('client_id', clientId)
+  url.searchParams.set('redirect_uri', REDIRECT_URI)
+  url.searchParams.set('scope', 'ncm:read')
+  url.searchParams.set('code_challenge', challenge)
+  url.searchParams.set('code_challenge_method', 'S256')
+  url.searchParams.set('state', 'e2e-uidless')
+  url.searchParams.set('resource', `${BASE}/mcp`)
+
+  const authorize = await fetch(url, { redirect: 'manual' })
+  const authzCookie = (authorize.headers.get('set-cookie') ?? '').split(';')[0]
+  const complete = await json(`${BASE}/api/auth/complete`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', cookie: authzCookie },
+    body: JSON.stringify({ jar: jarString }),
+  })
+  const code = new URL(complete.body?.redirect ?? 'http://invalid/').searchParams.get('code')
+  if (!code) return null
+
+  const response = await fetch(`${BASE}/token`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      code_verifier: verifier,
+      client_id: clientId,
+      redirect_uri: REDIRECT_URI,
+      resource: `${BASE}/mcp`,
+    }).toString(),
+  })
+  const body = await response.json().catch(() => ({}))
+  return typeof body.access_token === 'string' ? body.access_token : null
+}
+
 async function main() {
   console.log(`NeteaseCloudMusic MCP — OAuth e2e against ${BASE}`)
 
@@ -466,6 +509,81 @@ async function main() {
     if (!liveOk) {
       console.log('       (upstream risk gate answered instead of data; set NCM_E2E_JAR to assert songs)')
     }
+  }
+
+  // The whole flow above posts /api/auth/complete without a userId (the synthetic jar has
+  // no account behind it), so this access token is uid-less — exactly the state a QR login
+  // produces when the 803 body omits `account`. But `requiresLogin` gates on MUSIC_U, and the
+  // synthetic jar is MUSIC_A-only, so mint a second uid-less token over a MUSIC_U jar to
+  // reach the handlers that used to demand a uid from the token.
+  section('9. uid-less token resolves the account from the jar')
+  const uidlessJar = process.env.NCM_E2E_JAR || 'MUSIC_U=e2e-uidless-session; __csrf=e2e-csrf'
+  const uidlessToken = await mintTokenForJar(clientId, uidlessJar)
+  check('a uid-less token can be minted over a MUSIC_U jar', typeof uidlessToken === 'string')
+
+  const callWith = async (token, method, params) => {
+    const response = await fetch(`${BASE}/mcp`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+        authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: Math.floor(Math.random() * 1e6), method, params }),
+    })
+    const text = await response.text()
+    const dataLine = text
+      .split('\n')
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trim())
+      .pop()
+    return { status: response.status, body: dataLine ? JSON.parse(dataLine) : null }
+  }
+
+  const playlists = await callWith(uidlessToken, 'tools/call', {
+    name: 'ncm_my_playlists',
+    arguments: { pageSize: 5 },
+  })
+  const playlistsText = playlists.body?.result?.content?.[0]?.text ?? ''
+  const playlistsErrored = playlists.body?.result?.isError === true
+  check(
+    'ncm_my_playlists does not demand a uid from the token',
+    playlists.status === 200 &&
+      Boolean(playlists.body?.result) &&
+      !/No account id in this session/i.test(playlistsText),
+    playlistsText.slice(0, 160),
+  )
+
+  if (process.env.NCM_E2E_JAR) {
+    check(
+      'a uid-less token still lists playlists for a real jar',
+      !playlistsErrored && /playlists?\b/i.test(playlistsText),
+      playlistsText.slice(0, 160),
+    )
+  } else {
+    // The bogus MUSIC_U resolves to no account upstream, so the read must fail — but with the
+    // honest diagnostic that names user_account + ncm_raw, never by telling the user to sign
+    // in again (re-login re-runs the same lossy capture and cannot repair a uid-less token).
+    check(
+      'an unresolvable session is reported as an upstream identity gap',
+      playlistsErrored && /user_account/.test(playlistsText) && /ncm_raw/.test(playlistsText),
+      playlistsText.slice(0, 220),
+    )
+    check(
+      'the unresolved-session message does not blame the sign-in',
+      !/sign in again|re-login|reconnect/i.test(playlistsText),
+      playlistsText.slice(0, 220),
+    )
+
+    const status = await callWith(uidlessToken, 'tools/call', { name: 'ncm_account_status', arguments: {} })
+    const statusText = status.body?.result?.content?.[0]?.text ?? ''
+    check(
+      'ncm_account_status names the empty upstream identity instead of "anonymous"',
+      status.body?.result?.isError === true &&
+        /user_account/.test(statusText) &&
+        !/Anonymous session/i.test(statusText),
+      statusText.slice(0, 220),
+    )
   }
 
   const bogus = await fetch(`${BASE}/mcp`, {
