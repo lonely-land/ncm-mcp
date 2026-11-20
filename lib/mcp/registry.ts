@@ -9,11 +9,14 @@ import { UID_DIAGNOSTIC } from '@/lib/ncm/uid'
 import {
   MAX_TOOL_TEXT,
   MAX_TEXT_FIELD_CHARS,
+  PAGE_WINDOW_VOCAB,
+  RAW_WINDOW_VOCAB,
   TEXT_LIMITS,
   capText,
   capTextFields,
   clampTextLimit,
   enforceCeiling,
+  restartHint,
   slimComment,
   slimPlaylist,
   slimSong,
@@ -24,11 +27,12 @@ import {
   trimText,
   truncateLines,
   truncateText,
+  type WindowReport,
+  type WindowVocab,
 } from '@/lib/ncm/serialize'
 import {
   DEFAULT_PAGE_SIZE,
   MAX_PAGE_SIZE,
-  findDominantArray,
   localFetchLimit,
   pageMeta,
   pageRequest,
@@ -44,6 +48,7 @@ import {
   type PagedGroup,
   type PagingMode,
 } from '@/lib/mcp/pagination'
+import { windowRawBody } from '@/lib/mcp/raw-window'
 
 export interface ToolRuntime {
   jar: CookieJar
@@ -396,9 +401,20 @@ function applyCeiling(def: ToolDef, result: ToolResult): ToolResult {
  * truncation that keeps the document parseable. Handlers use this instead of
  * `JSON.stringify`, so every JSON result is bounded the same way.
  */
-function renderJsonResult(body: any, fieldLimit: number = TEXT_LIMITS.field, ceiling: number = TEXT_LIMITS.result): string {
+function renderJsonResult(
+  body: any,
+  fieldLimit: number = TEXT_LIMITS.field,
+  ceiling: number = TEXT_LIMITS.result,
+  options: { vocab?: WindowVocab; windows?: WindowReport[]; correctMore?: string[] } = {},
+): string {
   const { body: trimmed, notes } = trimGenericWithNotes(body)
-  return toStructuredText(capTextFields(trimmed, fieldLimit), { limit: ceiling, notes })
+  return toStructuredText(capTextFields(trimmed, fieldLimit), {
+    limit: ceiling,
+    notes,
+    ...(options.vocab ? { vocab: options.vocab } : {}),
+    ...(options.windows ? { windows: options.windows } : {}),
+    ...(options.correctMore ? { correctMore: options.correctMore } : {}),
+  })
 }
 
 function songLine(song: any): string {
@@ -1092,7 +1108,9 @@ const discoverTools: ToolDef[] = [
       const cut = truncateLines(dayBlocks, {
         limit: TEXT_LIMITS.result,
         unit: 'days',
-        hint: () => 'narrow the date range or use a smaller pageSize',
+        vocab: PAGE_WINDOW_VOCAB,
+        hint: (record) =>
+          `narrow the date range, or ${restartHint(record, meta.offset, PAGE_WINDOW_VOCAB)}`,
       })
       const delivered = cut.kept
       const adjusted: PagedGroup =
@@ -1837,13 +1855,8 @@ function renderCommentPage(comments: any[], meta: PageMeta, total?: number): str
   const cut = truncateLines(lines, {
     limit: TEXT_LIMITS.result - header.length - 2,
     unit,
-    // Items dropped from the tail are missing from *this* page, so re-reading must
-    // start at the page whose window begins at or before this offset.
-    hint: (record) => {
-      const keep = Math.max(1, record.kept)
-      const restart = Math.floor(meta.offset / keep) + 1
-      return `re-request with pageSize<=${keep} and page=${restart} to read these ${unit}`
-    },
+    vocab: PAGE_WINDOW_VOCAB,
+    hint: (record) => restartHint(record, meta.offset, PAGE_WINDOW_VOCAB),
   })
   const adjusted: PagedGroup =
     cut.kept < comments.length
@@ -2321,8 +2334,10 @@ const metaTools: ToolDef[] = [
       `${TEXT_LIMITS.field}, max ${MAX_TEXT_FIELD_CHARS}); the result names any field it shortened. ` +
       'limit and offset are forwarded to the endpoint as real parameters and take precedence over ' +
       'the same keys inside params, so an offset-capable endpoint pages upstream instead of locally. ' +
-      'Note that many NetEase endpoints answer with limit+1 rows to report their own "more" flag; ' +
-      'that extra row is the endpoint’s signal, not part of your requested window.',
+      'limit is also enforced on the response: many NetEase endpoints ignore it or answer with ' +
+      'limit+1 rows for their own "more" flag, so the result is sliced to at most `limit` rows, ' +
+      '`request` echoes what was returned versus the endpoint’s total, `more` is true whenever rows ' +
+      'were withheld, and a `truncated.window` block says how to read the rest with limit/offset.',
     input: z.object({
       endpoint: z.string().min(1).describe('Endpoint name, from ncm_list_endpoints'),
       params: z
@@ -2336,8 +2351,8 @@ const metaTools: ToolDef[] = [
         .max(MAX_PAGE_SIZE)
         .optional()
         .describe(
-          `Rows to ask the endpoint for (1..${MAX_PAGE_SIZE}). Forwarded upstream as \`limit\`; ` +
-            'endpoints that over-deliver may return one extra row for their own "more" flag.',
+          `Maximum rows to return per array (1..${MAX_PAGE_SIZE}). Forwarded upstream as \`limit\` ` +
+            'and enforced on the response even when the endpoint ignores it or over-delivers by one row.',
         ),
       offset: z
         .number()
@@ -2394,7 +2409,9 @@ const metaTools: ToolDef[] = [
       const fieldLimit = clampTextLimit(args.maxChars, TEXT_LIMITS.field)
       // `limit`/`offset` are real inputs now, so they reach the endpoint instead of
       // being stripped by the schema. A top-level value wins over the same key inside
-      // `params`; `params` on its own keeps working exactly as before.
+      // `params`; `params` on its own keeps working exactly as before. The endpoint
+      // may ignore both — which is why the delivered array is bounded below rather
+      // than trusted to the upstream.
       const upstream: Record<string, unknown> = { ...(args.params ?? {}) }
       if (args.limit !== undefined) upstream.limit = args.limit
       if (args.offset !== undefined) upstream.offset = args.offset
@@ -2402,30 +2419,14 @@ const metaTools: ToolDef[] = [
         jar: runtime.jar,
         fakeIp: runtime.fakeIp,
       })
-      // Echo the window that actually went upstream, plus the endpoint's own "more"
-      // flag when it sends one, so a caller can tell the params were honoured.
-      const sentLimit = typeof upstream.limit === 'number' ? upstream.limit : undefined
-      const sentOffset = typeof upstream.offset === 'number' ? upstream.offset : undefined
-      const body = result.body
-      let payload = body
-      if (
-        body &&
-        typeof body === 'object' &&
-        !Array.isArray(body) &&
-        (sentLimit !== undefined || sentOffset !== undefined)
-      ) {
-        payload = {
-          ...body,
-          request: {
-            ...(sentLimit !== undefined ? { limit: sentLimit } : {}),
-            ...(sentOffset !== undefined ? { offset: sentOffset } : {}),
-            ...(typeof body.more === 'boolean' ? { hasMore: body.more } : {}),
-            ...(typeof body.total === 'number' ? { total: body.total } : {}),
-            note: 'window sent upstream as limit/offset; some endpoints answer with limit+1 rows for their own more flag',
-          },
-        }
-      }
-      const text = renderJsonResult(payload, fieldLimit, TEXT_LIMITS.raw)
+      const requestedLimit = typeof upstream.limit === 'number' ? upstream.limit : undefined
+      const requestedOffset = typeof upstream.offset === 'number' ? upstream.offset : undefined
+      const windowed = windowRawBody(result.body, { limit: requestedLimit, offset: requestedOffset })
+      const text = renderJsonResult(windowed.body, fieldLimit, TEXT_LIMITS.raw, {
+        vocab: RAW_WINDOW_VOCAB,
+        windows: windowed.windows,
+        correctMore: windowed.morePaths,
+      })
       return { content: [{ type: 'text', text }], isError: !result.ok }
     },
   },
