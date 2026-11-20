@@ -168,6 +168,18 @@ const STRESS_CALLS = [
 ]
 
 /**
+ * Window probes for the raw escape hatch: the caller's `limit` must bound the delivered
+ * array whatever the endpoint does with it, and a withheld tail must never be reported
+ * as complete. `toplist` ignores `limit` (65 charts always); `user_playlist` over-delivers
+ * one row for its own `more`; `simi_song` ignores `limit` and needs it inside `params`.
+ */
+const RAW_WINDOW_PROBES = [
+  { name: 'ncm_raw', args: { endpoint: 'toplist', params: {}, limit: 2 }, rowsPath: 'list' },
+  { name: 'ncm_raw', args: { endpoint: 'user_playlist', params: { uid: 32953014 }, limit: 2 }, rowsPath: 'playlist' },
+  { name: 'ncm_raw', args: { endpoint: 'simi_song', params: { id: 347230, limit: 2 } }, rowsPath: 'songs' },
+]
+
+/**
  * Tools whose upstream call needs a real account. They still count as healthy when they
  * return the server's coherent "needs login" message instead of data.
  */
@@ -546,6 +558,50 @@ async function main() {
     totalChecks.push({ name: label, verdict: verdict.ok ? 'ok' : 'FAIL', detail: verdict.detail })
   }
 
+  // --- Raw window ----------------------------------------------------------
+  // A raw endpoint's `limit` is a contract, not a hint: the delivered array must never
+  // exceed it, and a withheld tail must never read as a complete answer.
+  const rawWindowChecks = []
+  for (const probe of RAW_WINDOW_PROBES) {
+    if (!tools.some((tool) => tool.name === probe.name)) continue
+    const result = await callTool(probe.name, probe.args)
+    if (result.isError) {
+      rawWindowChecks.push({ name: JSON.stringify(probe.args), verdict: 'skip', detail: 'upstream gate' })
+      continue
+    }
+    let parsed
+    try {
+      parsed = JSON.parse(result.text.trim())
+    } catch {
+      rawWindowChecks.push({ name: JSON.stringify(probe.args), verdict: 'skip', detail: 'not JSON (upstream gate)' })
+      continue
+    }
+    const limit = probe.args.limit ?? probe.args.params?.limit
+    const rows = Array.isArray(parsed?.[probe.rowsPath]) ? parsed[probe.rowsPath] : []
+    const withheld = parsed?.request?.withheld
+    const problems = []
+    if (rows.length > limit) problems.push(`${rows.length} rows for limit=${limit}`)
+    if (typeof withheld === 'number' && withheld > 0 && parsed?.more === false) {
+      problems.push('a withheld tail still reports more:false')
+    }
+    if (typeof withheld === 'number' && typeof parsed?.request?.returned === 'number') {
+      if (parsed.request.returned !== rows.length) problems.push(`request.returned=${parsed.request.returned} but ${rows.length} rows`)
+    }
+    // Any truncation hint must name a parameter this tool actually has.
+    if (/"truncated"/.test(result.text) && /pageSize/.test(result.text)) {
+      problems.push('the truncation hint names pageSize, which ncm_raw does not take')
+    }
+    if (problems.length > 0) failures += 1
+    rawWindowChecks.push({
+      name: JSON.stringify(probe.args),
+      verdict: problems.length > 0 ? 'FAIL' : 'ok',
+      detail:
+        problems.length > 0
+          ? problems.join('; ')
+          : `${rows.length} rows, withheld=${withheld ?? 0}, more=${parsed?.more}`,
+    })
+  }
+
   // --- Stress pass ---------------------------------------------------------
   // The oversized cases: a normal-sized sample can pass while the worst case still
   // severs JSON or blows past the ceiling.
@@ -643,6 +699,15 @@ async function main() {
     checks += totalChecks.length
   }
 
+  if (rawWindowChecks.length > 0) {
+    console.log('\nRaw window (ncm_raw limit)')
+    for (const check of rawWindowChecks) {
+      const mark = check.verdict === 'FAIL' ? 'FAIL' : check.verdict === 'ok' ? ' ok ' : ' -- '
+      console.log(`${mark} ${check.name.padEnd(56)} ${check.detail}`)
+    }
+    checks += rawWindowChecks.length
+  }
+
   if (stressChecks.length > 0) {
     console.log('\nOversize stress')
     for (const check of stressChecks) {
@@ -660,6 +725,7 @@ async function main() {
   const stressFailed = stressChecks.filter((check) => check.verdict === 'FAIL').length
   const pagingFailed = pagingChecks.filter((check) => check.verdict === 'FAIL').length
   const totalFailed = totalChecks.filter((check) => check.verdict === 'FAIL').length
+  const rawWindowFailed = rawWindowChecks.filter((check) => check.verdict === 'FAIL').length
   console.log(
     `${checks} checks · ${ok} tools ok · ${loginRequired} need a real login · ${failures} failed · ` +
       `${oversized} oversized (>${DEFAULT_CEILING} chars) · ${invalidJson} invalid JSON · ` +
@@ -667,7 +733,7 @@ async function main() {
   )
   console.log(
     `paging failures: ${pagingFailed} · total-reporting failures: ${totalFailed} · ` +
-      `oversize failures: ${stressFailed}`,
+      `raw-window failures: ${rawWindowFailed} · oversize failures: ${stressFailed}`,
   )
   if (failures > 0 || oversized > 0 || invalidJson > 0) process.exitCode = 1
 }

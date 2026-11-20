@@ -388,6 +388,24 @@ export interface DropRecord {
   pageSize: number
 }
 
+/**
+ * The paging parameters a tool actually exposes, so a hint never names one the caller
+ * cannot pass. Curated paged tools take `page`/`pageSize`; the raw escape hatch takes
+ * `limit`/`offset`. Hardcoding either wording told `ncm_raw` callers to re-request with
+ * a `pageSize` argument that tool does not have.
+ */
+export interface WindowVocab {
+  /** Item-count parameter name, e.g. "pageSize" or "limit". */
+  size: string
+  /** Zero-based start parameter name, e.g. "offset". Omit for tools without one. */
+  start?: string
+  /** Page-number parameter name, e.g. "page". Omit for tools without one. */
+  page?: string
+}
+
+export const PAGE_WINDOW_VOCAB: WindowVocab = { size: 'pageSize', page: 'page' }
+export const RAW_WINDOW_VOCAB: WindowVocab = { size: 'limit', start: 'offset' }
+
 export interface TruncationOptions {
   /** Ceiling on the returned text, in characters. */
   limit: number
@@ -399,13 +417,67 @@ export interface TruncationOptions {
   keepTail?: string
   /** Arrays `trimGeneric` shortened before serialization; reported in the notice. */
   notes?: TrimNote[]
+  /** Parameter vocabulary for hints; defaults to the curated `pageSize`/`page` wording. */
+  vocab?: WindowVocab
+  /**
+   * Arrays the caller bounded with the tool's own window parameters. Each entry carries
+   * the array's true upstream size, so a shortfall can be stated against the array
+   * rather than against the slice that survived — and so `total` in the drop accounting
+   * is the upstream size, not the post-window length.
+   */
+  windows?: WindowReport[]
+  /**
+   * Dot paths of boolean "more exists" flags to keep honest. When any item is withheld,
+   * a flag at one of these paths that reads `false` is corrected to `true`: a truncated
+   * payload must never claim it delivered everything.
+   */
+  correctMore?: string[]
 }
 
-function defaultHint(record: DropRecord): string {
-  const noun = record.total === 1 ? record.unit.replace(/s$/, '') : record.unit
+export interface WindowReport {
+  /** Dot path of the array the caller asked a bounded slice of. */
+  path: string
+  /** Noun for the items when the path alone is not descriptive. */
+  unit?: string
+  /** How many items the upstream array held, before the requested window applied. */
+  upstreamTotal: number
+  /** How many items the requested window actually allowed. */
+  delivered: number
+}
+
+/** "Re-request with ... to read them", in the tool's own parameter names. */
+function reRequest(vocab: WindowVocab, size: number, page?: number): string {
+  const pagePart = vocab.page && page !== undefined ? ` and ${vocab.page}=${page}` : ''
+  return `re-request with ${vocab.size}<=${size}${pagePart}`
+}
+
+/** The re-request sentence with a tool's own parameter names, for custom hints. */
+export function reRequestWith(vocab: WindowVocab, size: number, page?: number): string {
+  return reRequest(vocab, size, page)
+}
+
+/**
+ * Hint for a rendered page whose tail was dropped: restart the window at a size the
+ * ceiling can hold, beginning at or before `offset` so nothing is skipped. Lives here so
+ * every tool names the parameters it actually exposes.
+ */
+export function restartHint(record: DropRecord, offset: number, vocab: WindowVocab): string {
+  const keep = Math.max(1, record.kept)
+  const restart = vocab.page ? Math.floor(offset / keep) + 1 : undefined
+  return reRequest(vocab, keep, restart)
+}
+
+/** "3 playlist" reads as a bug; singular for one, plural otherwise. */
+export function pluralize(unit: string, count: number): string {
+  if (count === 1) return unit.replace(/s$/, '')
+  return /s$/.test(unit) ? unit : `${unit}s`
+}
+
+function defaultHint(record: DropRecord, vocab: WindowVocab): string {
+  const noun = pluralize(record.unit, record.total)
   return (
     `${record.dropped} ${noun} at the end of this page were not delivered; ` +
-    `re-request with pageSize<=${Math.max(1, record.kept)} to receive all ${record.total}`
+    `${reRequest(vocab, Math.max(1, record.kept))} to receive all ${record.total}`
   )
 }
 
@@ -419,12 +491,12 @@ function restartPageFor(record: DropRecord, offset: number): number {
   return Math.floor(offset / Math.max(1, record.kept)) + 1
 }
 
-function hintFor(record: DropRecord, restartPage: number): string {
-  const noun = record.total === 1 ? record.unit.replace(/s$/, '') : record.unit
-  const where = restartPage > 1 ? `, starting at page=${restartPage}` : ''
+function hintFor(record: DropRecord, restartPage: number, vocab: WindowVocab): string {
+  const noun = pluralize(record.unit, record.total)
+  const where = restartPage > 1 ? `, starting at ${vocab.page ?? 'page'}=${restartPage}` : ''
   return (
     `${record.dropped} of this page's ${record.total} ${noun} were not delivered; ` +
-    `re-request with pageSize<=${Math.max(1, record.kept)}${where} to read them`
+    `${reRequest(vocab, Math.max(1, record.kept), vocab.page ? restartPage : undefined)}${where} to read them`
   )
 }
 
@@ -547,6 +619,7 @@ function truncationNotice(
   restartPage: (record: DropRecord) => number,
 ) {
   const notes = options.notes ?? []
+  const vocab = options.vocab ?? PAGE_WINDOW_VOCAB
   return {
     reason: `the full result exceeded ${limit} characters, so whole items were dropped from the tail`,
     ...(drops.length > 0
@@ -558,7 +631,7 @@ function truncationNotice(
             total: record.total,
             next: options.hint
               ? options.hint(record)
-              : hintFor(record, restartPage(record)),
+              : hintFor(record, restartPage(record), vocab),
           })),
         }
       : {}),
@@ -574,6 +647,85 @@ function truncationNotice(
         }
       : {}),
   }
+}
+
+/**
+ * The window the caller asked for versus what the upstream array actually held.
+ *
+ * When a caller bounds an array with `limit`, the delivered slice is *supposed* to be
+ * smaller than the array — that is the request working, not truncation. Reporting the
+ * slice's own length as `total` made `limit=2` on a 65-row endpoint read as "2 of 2",
+ * indistinguishable from having received everything. This block states the real
+ * upstream size and names the parameters that page through it.
+ */
+function windowNotice(options: TruncationOptions, deliveredNow?: (path: string) => number | undefined) {
+  const reports = options.windows ?? []
+  if (reports.length === 0) return undefined
+  const vocab = options.vocab ?? PAGE_WINDOW_VOCAB
+  const entries = reports.map((report) => {
+    // The ceiling may have taken part of this window's tail, so the delivered figure is
+    // read back from the body rather than trusted from the pre-ceiling pass.
+    const delivered = deliveredNow?.(report.path) ?? report.delivered
+    const noun = pluralize(report.unit ?? 'item', report.upstreamTotal)
+    const withheld = report.upstreamTotal - delivered
+    // The remainder starts right after what was delivered, so the exact call is
+    // `limit=withheld` at `offset=delivered`. This is the window talking, not the
+    // ceiling, so it names the exact arguments rather than an upper bound.
+    const startParam = vocab.start ?? vocab.page ?? 'offset'
+    const next =
+      withheld > 0
+        ? `${delivered} of ${report.upstreamTotal} ${noun} delivered for the requested window; ` +
+          `pass ${vocab.size}=${withheld} with ${startParam}=${delivered} to read the remaining ${withheld}`
+        : `all ${report.upstreamTotal} ${noun} the endpoint holds were delivered`
+    return {
+      field: report.path,
+      delivered,
+      upstreamTotal: report.upstreamTotal,
+      withheld,
+      next,
+    }
+  })
+  return { window: entries }
+}
+
+/**
+ * Force every "more exists" flag at `paths` to `true`, because something was withheld.
+ * A body that says `more: false` next to a truncated tail is a lie the caller cannot
+ * detect, so the flag is corrected rather than left to be misread as completeness.
+ */
+function correctMoreFlags(body: Json, paths: string[]): { body: Json; corrected: string[] } {
+  if (paths.length === 0 || !body || typeof body !== 'object') return { body, corrected: [] }
+  const corrected: string[] = []
+  let next = body
+  for (const path of paths) {
+    const keys = path.split('.').filter(Boolean)
+    if (keys.length === 0) continue
+    const current = readPathLoose(next, keys)
+    if (current === undefined || current === null) continue
+    next = writePathLoose(next, keys, true)
+    corrected.push(path)
+  }
+  return { body: next, corrected }
+}
+
+function readPathLoose(body: Json, keys: string[]): Json {
+  let cursor = body
+  for (const key of keys) {
+    if (!cursor || typeof cursor !== 'object') return undefined
+    cursor = cursor[key]
+  }
+  return cursor
+}
+
+function writePathLoose(body: Json, keys: string[], value: Json): Json {
+  const [head, ...rest] = keys
+  const source = body && typeof body === 'object' ? body : {}
+  if (rest.length === 0) return { ...source, [head]: value }
+  const child = source[head]
+  // Only descend through a real object; an absent flag stays absent rather than
+  // materialising a whole branch the endpoint never sent.
+  if (!child || typeof child !== 'object' || Array.isArray(child)) return body
+  return { ...source, [head]: writePathLoose(child, rest, value) }
 }
 
 /**
@@ -624,18 +776,52 @@ export function trimJsonToLimit(
 
   const build = () => {
     syncPaging()
+    syncRequest()
+    const notice = truncationNotice(limit, drops, options, (record) => {
+      const key = record.path
+      const original = baseline.get(key)
+      const offset =
+        original && original.meta && typeof original.meta.offset === 'number'
+          ? (original.meta.offset as number)
+          : 0
+      return restartPageFor(record, offset)
+    })
+    const window = windowNotice(options, (path) => finalLength(path))
     return stringify({
       ...container,
-      truncated: truncationNotice(limit, drops, options, (record) => {
-        const key = record.path
-        const original = baseline.get(key)
-        const offset =
-          original && original.meta && typeof original.meta.offset === 'number'
-            ? (original.meta.offset as number)
-            : 0
-        return restartPageFor(record, offset)
-      }),
+      truncated: window ? { ...notice, ...window } : notice,
     })
+  }
+
+  /** Items an array at `path` still carries, after every cap applied so far. */
+  const finalLength = (path: string): number | undefined => {
+    const list = readPathLoose(container, path.split('.').filter(Boolean))
+    return Array.isArray(list) ? list.length : undefined
+  }
+
+  /**
+   * Keep the `request` echo about what the result actually carries.
+   *
+   * The window pass records what it delivered, but the ceiling can still drop part of
+   * that tail. Leaving `request.returned` at the pre-ceiling number told a caller it had
+   * 27 rows in a result holding 7 — the same class of lie as `more: false`.
+   */
+  const syncRequest = () => {
+    const request = container?.request
+    if (!request || typeof request !== 'object' || Array.isArray(request)) return
+    const report = (options.windows ?? [])[0]
+    if (!report) return
+    const delivered = finalLength(report.path)
+    if (delivered === undefined) return
+    const upstreamTotal =
+      typeof request.upstreamTotal === 'number' ? request.upstreamTotal : report.upstreamTotal
+    request.returned = delivered
+    request.upstreamTotal = upstreamTotal
+    const withheld = Math.max(0, upstreamTotal - delivered)
+    if (withheld > 0) request.withheld = withheld
+    else delete request.withheld
+    if (withheld > 0) request.more = true
+    if (withheld > 0 && typeof container.more === 'boolean') container.more = true
   }
 
   /** Keep `paging` honest: a dropped tail is no longer part of `returned`. */
@@ -714,6 +900,17 @@ export function trimJsonToLimit(
     target.record.kept = target.cap
     target.record.dropped = target.record.total - target.cap * handleCount
     output = build()
+  }
+
+  // A withheld tail means the payload is not complete, whatever the endpoint's own
+  // `more` flag said before the ceiling was applied. Correcting it here covers the one
+  // case a caller cannot detect from the outside: `more: false` beside a short tail.
+  if (drops.length > 0 && (options.correctMore?.length ?? 0) > 0) {
+    const corrected = correctMoreFlags(container, options.correctMore ?? [])
+    if (corrected.corrected.length > 0) {
+      Object.assign(container, corrected.body)
+      output = build()
+    }
   }
 
   if (output.length > limit) {
@@ -800,7 +997,7 @@ export function truncateLines(
     total: lines.length,
     pageSize: lines.length,
   }
-  const hint = options.hint?.(record) ?? defaultHint(record)
+  const hint = options.hint?.(record) ?? defaultHint(record, options.vocab ?? PAGE_WINDOW_VOCAB)
   return {
     text: `${kept.join('\n')}\n…[truncated: dropped ${record.dropped} of ${record.total} ${options.unit} (${kept.length} kept); ${hint}]`,
     kept: kept.length,
@@ -818,6 +1015,10 @@ const JSON_START = /^\s*[[{]/
  * Serialize a body for a tool result under a hard ceiling. JSON stays valid JSON
  * (parsed first when a handler hands over a string that looks like JSON); plain text
  * is trimmed on line boundaries. Never returns a fragment `JSON.parse` rejects.
+ *
+ * A `windows` report is always surfaced, not only when the ceiling bites: a caller who
+ * asked `limit=2` of a 65-row endpoint must be able to see "2 of 65" even in a result
+ * small enough to need no trimming.
  */
 export function toStructuredText(body: Json, options: TruncationOptions): string {
   let parsed: Json = body
@@ -829,9 +1030,11 @@ export function toStructuredText(body: Json, options: TruncationOptions): string
       return truncateText(body, options)
     }
   }
-  const text = stringify(parsed)
+  const window = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? windowNotice(options) : undefined
+  const withWindow = window ? { ...parsed, truncated: { ...(parsed.truncated ?? {}), ...window } } : parsed
+  const text = stringify(withWindow)
   if (text.length <= options.limit) return text
-  return trimJsonToLimit(parsed, options).text
+  return trimJsonToLimit(withWindow, options).text
 }
 
 /** Matches the "items 1-20 of 680" range in a paging footer. */

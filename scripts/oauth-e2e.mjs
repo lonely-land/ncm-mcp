@@ -511,12 +511,69 @@ async function main() {
     }
   }
 
+  // The raw escape hatch must bound its payload by the caller's `limit`, even when the
+  // endpoint ignores it, and must never report a partial answer as complete.
+  if (rawEnabled) {
+    section('10. ncm_raw bounds its payload by the requested limit')
+    const rawCases = [
+      // `toplist` ignores limit entirely and always sends all 65 charts.
+      { label: 'toplist (endpoint ignores limit)', args: { endpoint: 'toplist', params: {}, limit: 2 } },
+      // `user_playlist` honours limit but answers with limit+1 rows for its own `more`.
+      { label: 'user_playlist (over-delivers limit+1)', args: { endpoint: 'user_playlist', params: { uid: 32953014 }, limit: 2 } },
+      // `simi_song` also ignores limit, and takes it only through params.
+      { label: 'simi_song (limit inside params)', args: { endpoint: 'simi_song', params: { id: 347230, limit: 2 } } },
+    ]
+    for (const probe of rawCases) {
+      const call = await mcpCall('tools/call', { name: 'ncm_raw', arguments: probe.args })
+      const text = call.body?.result?.content?.[0]?.text ?? ''
+      let parsed
+      try {
+        parsed = JSON.parse(text.trim())
+      } catch {
+        parsed = undefined
+      }
+      if (!parsed) {
+        // A guest session can trip the risk gate; that is not evidence about the window.
+        check(`${probe.label}: answered with JSON`, /verification|captcha|signed-in|unavailable/i.test(text), text.slice(0, 120))
+        continue
+      }
+      const arrays = Object.entries(parsed).filter(([, value]) => Array.isArray(value))
+      const oversized = arrays.filter(([, value]) => value.length > 2)
+      check(
+        `${probe.label}: limit=2 delivers at most 2 rows`,
+        oversized.length === 0,
+        arrays.map(([key, value]) => `${key}:${value.length}`).join(', '),
+      )
+      // Whatever the endpoint said about `more`, withheld rows must leave it true.
+      const withheld = parsed.request?.withheld
+      if (typeof withheld === 'number' && withheld > 0) {
+        check(`${probe.label}: a withheld tail never reports more:false`, parsed.more !== false, `more=${parsed.more}`)
+        check(
+          `${probe.label}: the response states delivered vs upstream total`,
+          parsed.request?.upstreamTotal === parsed.request?.returned + withheld,
+          JSON.stringify(parsed.request ?? {}).slice(0, 160),
+        )
+      }
+    }
+
+    // A truncated result's hint must name parameters the tool actually has.
+    const hintText = await (async () => {
+      const call = await mcpCall('tools/call', { name: 'ncm_raw', arguments: { endpoint: 'toplist', params: {} } })
+      return call.body?.result?.content?.[0]?.text ?? ''
+    })()
+    if (/"truncated"/.test(hintText)) {
+      check('ncm_raw truncation hint names limit, not pageSize', /limit<=|limit=/.test(hintText) && !/pageSize/.test(hintText), hintText.slice(-260))
+    } else {
+      console.log('  --   toplist fit in one result, skipping the truncation-hint check')
+    }
+  }
+
   // The whole flow above posts /api/auth/complete without a userId (the synthetic jar has
   // no account behind it), so this access token is uid-less — exactly the state a QR login
   // produces when the 803 body omits `account`. But `requiresLogin` gates on MUSIC_U, and the
   // synthetic jar is MUSIC_A-only, so mint a second uid-less token over a MUSIC_U jar to
   // reach the handlers that used to demand a uid from the token.
-  section('9. uid-less token resolves the account from the jar')
+  section('11. uid-less token resolves the account from the jar')
   const uidlessJar = process.env.NCM_E2E_JAR || 'MUSIC_U=e2e-uidless-session; __csrf=e2e-csrf'
   const uidlessToken = await mintTokenForJar(clientId, uidlessJar)
   check('a uid-less token can be minted over a MUSIC_U jar', typeof uidlessToken === 'string')

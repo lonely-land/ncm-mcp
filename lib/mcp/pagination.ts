@@ -10,6 +10,8 @@
 
 import * as z from 'zod'
 
+import { PAGE_WINDOW_VOCAB, pluralize, type WindowVocab } from '../ncm/serialize.ts'
+
 export const MAX_PAGE_SIZE = 100
 export const DEFAULT_PAGE_SIZE = 20
 /** Ceiling on how much one page may pull from an upstream that cannot offset. */
@@ -207,8 +209,8 @@ export function paginate<T>(
 }
 
 /** One-line, model-readable summary printed under every paged result. */
-export function pagingLine(meta: PageMeta, unit = 'items'): string {
-  const noun = meta.returned === 1 ? unit.replace(/s$/, '') : unit
+export function pagingLine(meta: PageMeta, unit = 'items', vocab: WindowVocab = PAGE_WINDOW_VOCAB): string {
+  const noun = pluralize(unit, meta.returned)
   const parts = [`page ${meta.page}`, `${meta.returned} ${noun}`]
   if (meta.total !== undefined) {
     if (meta.returned > 0) {
@@ -231,9 +233,10 @@ export function pagingLine(meta: PageMeta, unit = 'items'): string {
     const smaller = meta.returned
     const restartPage = Math.floor(meta.offset / smaller) + 1
     parts.push(`${meta.truncated} dropped by the size ceiling`)
-    parts.push(`re-request with pageSize<=${smaller} and page=${restartPage} to read this range, then continue`)
+    const pagePart = vocab.page ? ` and ${vocab.page}=${restartPage}` : ''
+    parts.push(`re-request with ${vocab.size}<=${smaller}${pagePart} to read this range, then continue`)
   } else if (meta.hasMore) {
-    parts.push(`next: page=${meta.page + 1}`)
+    parts.push(`next: ${vocab.page ?? 'page'}=${meta.page + 1}`)
   }
   return parts.join(' · ')
 }
@@ -248,15 +251,15 @@ export function pagingEmptyNote(meta: PageMeta, unit = 'items'): string {
 }
 
 /** Trailer appended to a rendered tool result so the model sees the paging state. */
-export function pagingFooter(groups: PagedGroup[]): string {
+export function pagingFooter(groups: PagedGroup[], vocab: WindowVocab = PAGE_WINDOW_VOCAB): string {
   if (groups.length === 0) return ''
   const single = groups.length === 1
   // Always emitted for a paged tool: an empty page still needs to say "0 of N",
   // otherwise the caller cannot tell an empty result from a missing one.
   const lines = groups.map((group) =>
     single
-      ? `paging: ${pagingLine(group.meta, group.unit)}`
-      : `${group.label}: ${pagingLine(group.meta, group.unit)}`,
+      ? `paging: ${pagingLine(group.meta, group.unit, vocab)}`
+      : `${group.label}: ${pagingLine(group.meta, group.unit, vocab)}`,
   )
   return `\n\n${lines.join('\n')}`
 }
