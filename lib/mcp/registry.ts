@@ -431,6 +431,65 @@ function renderSongList(songs: any[], heading: string): string {
   return `${heading}\n${songs.map(songLine).join('\n')}`
 }
 
+function isSongLike(value: any): boolean {
+  return Boolean(
+    value && typeof value === 'object' && !Array.isArray(value) && (value.name != null || value.id != null),
+  )
+}
+
+/**
+ * A recent-play row from `/api/play-record/song/list` is a history record, not a song.
+ * The song object is `data` (name, id, `ar`, `al`). `song` and `resource` are accepted
+ * when a payload uses those keys instead. `playTime` stays on the record.
+ */
+function historySong(record: any): any {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) return undefined
+  for (const key of ['data', 'song', 'resource']) {
+    if (isSongLike(record[key])) return record[key]
+  }
+  return isSongLike(record) ? record : undefined
+}
+
+/** `playTime` is unix milliseconds. Anything else is omitted rather than printed as undefined. */
+function formatPlayTime(value: unknown): string | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return undefined
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return undefined
+  return date.toISOString()
+}
+
+function recentPlayLine(record: any): string {
+  const nested = historySong(record)
+  const song = nested ? slimSong(nested) : {}
+  const name = typeof song.name === 'string' && song.name.length > 0 ? song.name : '(untitled)'
+  const artists = (Array.isArray(song.artists) ? song.artists : [])
+    .map((artist: any) => artist?.name)
+    .filter((artistName: unknown) => typeof artistName === 'string' && artistName.length > 0)
+    .join(', ')
+  const album = typeof song.album?.name === 'string' ? song.album.name : ''
+  const seconds =
+    typeof song.durationMs === 'number' && Number.isFinite(song.durationMs) && song.durationMs > 0
+      ? Math.round(song.durationMs / 1000)
+      : undefined
+  const id = song.id ?? record?.resourceId
+  const hasId = id !== undefined && id !== null && id !== ''
+  const played = formatPlayTime(record?.playTime)
+  return (
+    `- ${name}` +
+    (artists ? ` — ${artists}` : '') +
+    (album ? ` (${album})` : '') +
+    (seconds ? ` [${seconds}s]` : '') +
+    (hasId ? ` id=${id}` : '') +
+    (played ? ` played=${played}` : '')
+  )
+}
+
+function renderRecentSongs(body: any): string {
+  const records = body?.data?.list
+  if (!Array.isArray(records) || records.length === 0) return 'Recently played\n(no songs)'
+  return `Recently played\n${records.map(recentPlayLine).join('\n')}`
+}
+
 /**
  * Note for an empty rendered page. Uses the paging metadata stitched onto the body
  * by `paginateGroups`, so "page 9 is past the end" reads differently from "none".
@@ -1615,7 +1674,7 @@ const libraryTools: ToolDef[] = [
     endpoint: 'record_recent_song',
     requiresLogin: true,
     paging: { mode: 'local', groups: [{ path: 'data.list', label: 'songs' }] },
-    render: (body) => renderSongList((body?.data?.list ?? []).map(slimSong), 'Recently played'),
+    render: (body) => renderRecentSongs(body),
   },
   {
     name: 'ncm_my_playlists',
